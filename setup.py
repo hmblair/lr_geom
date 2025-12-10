@@ -22,8 +22,7 @@ setup(
     ],
     extras_require={
         'spherical': ['sphericart'],
-        'graphs': ['dgl'],
-        'all': ['sphericart', 'dgl'],
+        'all': ['sphericart'],
     },
     author=AUTHOR,
     author_email=EMAIL,

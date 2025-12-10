@@ -18,7 +18,6 @@ Modules:
 
 Optional Dependencies:
     - sphericart: Required for SphericalHarmonic
-    - dgl: Required for graph-based layers (GraphAttention, EquivariantTransformer)
 
 Example:
     >>> import lr_geom as lg
@@ -68,16 +67,19 @@ from .models import GNMA
 
 # Equivariant layers
 from .layers import (
-    is_dgl_available,
+    build_knn_graph,
     RadialWeight,
     EquivariantLinear,
     EquivariantGating,
     EquivariantTransition,
     EquivariantConvolution,
     EquivariantLayerNorm,
-    GraphAttention,
-    EquivariantAttention,
-    EquivariantTransformerBlock,
+    DenseAttention,
+    SparseAttention,
+    EquivariantDenseAttention,
+    EquivariantSparseAttention,
+    EquivariantDenseTransformerBlock,
+    EquivariantSparseTransformerBlock,
     EquivariantTransformer,
 )
 
@@ -109,15 +111,18 @@ __all__ = [
     # Models
     "GNMA",
     # Layers
-    "is_dgl_available",
+    "build_knn_graph",
     "RadialWeight",
     "EquivariantLinear",
     "EquivariantGating",
     "EquivariantTransition",
     "EquivariantConvolution",
     "EquivariantLayerNorm",
-    "GraphAttention",
-    "EquivariantAttention",
-    "EquivariantTransformerBlock",
+    "DenseAttention",
+    "SparseAttention",
+    "EquivariantDenseAttention",
+    "EquivariantSparseAttention",
+    "EquivariantDenseTransformerBlock",
+    "EquivariantSparseTransformerBlock",
     "EquivariantTransformer",
 ]

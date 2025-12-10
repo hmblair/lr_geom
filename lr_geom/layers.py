@@ -1,60 +1,84 @@
-"""Equivariant neural network layers for graph-based architectures.
+"""Equivariant neural network layers for geometric deep learning.
 
 This module provides SE(3)-equivariant layers for building geometric
-deep learning models on graphs. These layers maintain equivariance to
-rotations and translations when processing 3D molecular or point cloud data.
+deep learning models. These layers maintain equivariance to rotations
+and translations when processing 3D molecular or point cloud data.
 
-The layers that require graph operations use DGL (Deep Graph Library).
-DGL is an optional dependency - import will succeed but instantiating
-graph-based layers without DGL will raise ImportError.
+Supports two attention modes:
+- Dense: All-to-all attention using PyTorch's scaled_dot_product_attention
+- Sparse: k-NN based attention with regular (N, k) neighbor structure
 
 Classes:
     RadialWeight: Neural network for computing tensor product weights
     EquivariantLinear: Linear layer preserving spherical tensor structure
     EquivariantGating: Norm-based gating for spherical tensors
     EquivariantTransition: MLP transition layer for spherical tensors
-    EquivariantConvolution: SE(3)-equivariant graph convolution
+    EquivariantConvolution: SE(3)-equivariant convolution
     EquivariantLayerNorm: Equivariant layer normalization
-    GraphAttention: Multi-head attention on graphs (requires DGL)
-    EquivariantAttention: Equivariant attention layer (requires DGL)
-    EquivariantTransformerBlock: Single transformer block (requires DGL)
-    EquivariantTransformer: Full equivariant transformer (requires DGL)
+    DenseAttention: All-to-all multi-head attention
+    SparseAttention: k-NN based multi-head attention
+    EquivariantDenseAttention: SE(3)-equivariant dense attention
+    EquivariantSparseAttention: SE(3)-equivariant sparse attention
+    EquivariantDenseTransformerBlock: Dense transformer block
+    EquivariantSparseTransformerBlock: Sparse transformer block
+    EquivariantTransformer: Full equivariant transformer
 """
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .representations import Repr, ProductRepr
 from .equivariant import RepNorm, EquivariantBases, FEATURE_DIM
 
-# Lazy import for DGL
-_dgl: Any = None
-_dgl_available: bool | None = None
 
+def build_knn_graph(coordinates: torch.Tensor, k: int) -> torch.Tensor:
+    """Build k-nearest neighbor graph from 3D coordinates.
 
-def _get_dgl() -> Any:
-    """Lazily import DGL and cache the result."""
-    global _dgl, _dgl_available
+    Args:
+        coordinates: Node coordinates of shape (N, 3).
+        k: Number of nearest neighbors per node.
 
-    if _dgl_available is None:
-        try:
-            import dgl
-            _dgl = dgl
-            _dgl_available = True
-        except ImportError:
-            _dgl_available = False
+    Returns:
+        Neighbor indices of shape (N, k), where neighbor_idx[i] contains
+        the k nearest neighbor indices for node i (excluding self).
 
-    return _dgl
+    Example:
+        >>> coords = torch.randn(100, 3)
+        >>> neighbor_idx = build_knn_graph(coords, k=16)
+        >>> neighbor_idx.shape
+        torch.Size([100, 16])
+    """
+    N = coordinates.size(0)
 
+    # Handle edge case where N <= k
+    if N <= k + 1:
+        # Use all other nodes as neighbors
+        all_idx = torch.arange(N, device=coordinates.device)
+        neighbor_idx = all_idx.unsqueeze(0).expand(N, -1)
+        # Exclude self: create mask and gather non-self indices
+        mask = neighbor_idx != torch.arange(N, device=coordinates.device).unsqueeze(1)
+        # Pad if necessary
+        result = torch.zeros(N, k, dtype=torch.long, device=coordinates.device)
+        for i in range(N):
+            others = neighbor_idx[i, mask[i]]
+            result[i, :len(others)] = others
+            if len(others) < k:
+                # Repeat last neighbor to fill
+                result[i, len(others):] = others[-1] if len(others) > 0 else 0
+        return result
 
-def is_dgl_available() -> bool:
-    """Check if DGL is installed and available."""
-    _get_dgl()
-    return _dgl_available or False
+    # Compute pairwise squared distances
+    dists = torch.cdist(coordinates, coordinates)  # (N, N)
+
+    # Get k+1 nearest neighbors (including self at index 0)
+    _, indices = dists.topk(k + 1, largest=False, dim=-1)  # (N, k+1)
+
+    # Exclude self (first column after sorting by distance)
+    return indices[:, 1:]  # (N, k)
 
 
 class RadialWeight(nn.Module):
@@ -455,40 +479,32 @@ class EquivariantLayerNorm(nn.Module):
         return f * norms_r[..., self.ix]
 
 
-class GraphAttention(nn.Module):
-    """Multi-head attention on graphs using DGL.
+class DenseAttention(nn.Module):
+    """All-to-all multi-head attention using PyTorch SDPA.
 
-    Computes attention-weighted aggregation of values based on
-    key-query dot products along graph edges.
+    Computes attention over all pairs of nodes using PyTorch's
+    efficient scaled_dot_product_attention implementation.
 
     Args:
         hidden_size: Total hidden dimension.
         nheads: Number of attention heads.
         dropout: Dropout probability for attention weights.
 
-    Raises:
-        ImportError: If DGL is not installed.
-
     Example:
-        >>> attn = GraphAttention(64, nheads=4)
-        >>> # keys, queries: (E, 64), values: (E, 64)
-        >>> output = attn(graph, keys, queries, values)  # (N, 64)
+        >>> attn = DenseAttention(64, nheads=4)
+        >>> keys = torch.randn(100, 64)
+        >>> queries = torch.randn(100, 64)
+        >>> values = torch.randn(100, 64)
+        >>> output = attn(keys, queries, values)  # (100, 64)
     """
 
     def __init__(
-        self: GraphAttention,
+        self: DenseAttention,
         hidden_size: int,
         nheads: int = 1,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
-
-        dgl = _get_dgl()
-        if dgl is None:
-            raise ImportError(
-                "DGL is required for GraphAttention. "
-                "Install with: pip install dgl"
-            )
 
         if hidden_size % nheads != 0:
             raise ValueError(
@@ -497,67 +513,163 @@ class GraphAttention(nn.Module):
 
         self.hidden_size = hidden_size
         self.nheads = nheads
-        self.tmpsize = (nheads, hidden_size // nheads)
-
-        self.dropout = nn.Dropout1d(dropout)
-        self.temp = hidden_size ** -0.5
-        self.lrelu = nn.LeakyReLU(0.2)
+        self.head_dim = hidden_size // nheads
+        self.dropout_p = dropout
 
     def forward(
-        self: GraphAttention,
-        graph: Any,  # dgl.DGLGraph
+        self: DenseAttention,
         keys: torch.Tensor,
         queries: torch.Tensor,
         values: torch.Tensor,
         mask: torch.Tensor | None = None,
-        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Compute graph attention.
+        """Compute dense attention.
 
         Args:
-            graph: DGL graph.
-            keys: Key vectors of shape (E, hidden_size).
-            queries: Query vectors of shape (E, hidden_size).
-            values: Value vectors of shape (E, hidden_size).
-            mask: Optional edge mask of shape (E,).
-            bias: Optional attention bias of shape (E, nheads).
+            keys: Key vectors of shape (N, hidden_size).
+            queries: Query vectors of shape (N, hidden_size).
+            values: Value vectors of shape (N, hidden_size).
+            mask: Optional attention mask of shape (N, N).
+                  True values are masked out.
 
         Returns:
-            Aggregated values of shape (N, hidden_size).
+            Attended values of shape (N, hidden_size).
         """
-        dgl = _get_dgl()
+        N = keys.size(0)
 
-        # Reshape for multi-head attention
-        keys = keys.view(graph.num_edges(), *self.tmpsize)
-        queries = queries.view(graph.num_edges(), *self.tmpsize)
-        values = values.view(graph.num_edges(), *self.tmpsize)
+        # Reshape for multi-head: (N, nheads, head_dim)
+        keys = keys.view(N, self.nheads, self.head_dim)
+        queries = queries.view(N, self.nheads, self.head_dim)
+        values = values.view(N, self.nheads, self.head_dim)
 
-        # Compute attention scores
-        scores = (keys * queries).sum(-1) * self.temp
-        scores = self.lrelu(scores)
+        # Transpose for SDPA: (nheads, N, head_dim) -> (1, nheads, N, head_dim)
+        keys = keys.transpose(0, 1).unsqueeze(0)
+        queries = queries.transpose(0, 1).unsqueeze(0)
+        values = values.transpose(0, 1).unsqueeze(0)
 
-        # Softmax over edges
-        weights = dgl.ops.edge_softmax(graph, scores)
+        # Prepare mask for SDPA if provided
+        attn_mask = None
+        if mask is not None:
+            # SDPA expects mask where True = masked out
+            attn_mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, N, N)
+
+        # Apply scaled dot product attention
+        dropout_p = self.dropout_p if self.training else 0.0
+        output = F.scaled_dot_product_attention(
+            queries, keys, values,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+        )  # (1, nheads, N, head_dim)
+
+        # Reshape back: (N, hidden_size)
+        output = output.squeeze(0).transpose(0, 1).contiguous()
+        return output.view(N, self.hidden_size)
+
+
+class SparseAttention(nn.Module):
+    """k-NN based multi-head attention with regular neighbor structure.
+
+    Each node attends only to its k nearest neighbors, enabling
+    efficient local attention with O(N*k) complexity instead of O(N^2).
+
+    Args:
+        hidden_size: Total hidden dimension.
+        nheads: Number of attention heads.
+        dropout: Dropout probability for attention weights.
+
+    Example:
+        >>> attn = SparseAttention(64, nheads=4)
+        >>> keys = torch.randn(100, 64)
+        >>> queries = torch.randn(100, 64)
+        >>> values = torch.randn(100, 64)
+        >>> neighbor_idx = torch.randint(0, 100, (100, 16))
+        >>> output = attn(keys, queries, values, neighbor_idx)  # (100, 64)
+    """
+
+    def __init__(
+        self: SparseAttention,
+        hidden_size: int,
+        nheads: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        if hidden_size % nheads != 0:
+            raise ValueError(
+                f"hidden_size ({hidden_size}) must be divisible by nheads ({nheads})"
+            )
+
+        self.hidden_size = hidden_size
+        self.nheads = nheads
+        self.head_dim = hidden_size // nheads
+        self.scale = self.head_dim ** -0.5
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self: SparseAttention,
+        keys: torch.Tensor,
+        queries: torch.Tensor,
+        values: torch.Tensor,
+        neighbor_idx: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute sparse k-NN attention.
+
+        Args:
+            keys: Key vectors of shape (N, hidden_size).
+            queries: Query vectors of shape (N, hidden_size).
+            values: Value vectors of shape (N, hidden_size).
+            neighbor_idx: Neighbor indices of shape (N, k).
+            mask: Optional attention mask of shape (N, k).
+                  True values are masked out.
+
+        Returns:
+            Attended values of shape (N, hidden_size).
+        """
+        N, k = neighbor_idx.shape
+
+        # Reshape for multi-head: (N, nheads, head_dim)
+        queries = queries.view(N, self.nheads, self.head_dim)
+        keys = keys.view(N, self.nheads, self.head_dim)
+        values = values.view(N, self.nheads, self.head_dim)
+
+        # Gather neighbor keys and values: (N, k, nheads, head_dim)
+        neighbor_keys = keys[neighbor_idx]
+        neighbor_values = values[neighbor_idx]
+
+        # Compute attention scores: (N, nheads, k)
+        # queries: (N, nheads, head_dim) -> (N, nheads, 1, head_dim)
+        # neighbor_keys: (N, k, nheads, head_dim) -> (N, nheads, k, head_dim)
+        queries = queries.unsqueeze(2)  # (N, nheads, 1, head_dim)
+        neighbor_keys = neighbor_keys.transpose(1, 2)  # (N, nheads, k, head_dim)
+        neighbor_values = neighbor_values.transpose(1, 2)  # (N, nheads, k, head_dim)
+
+        scores = (queries @ neighbor_keys.transpose(-2, -1)).squeeze(2) * self.scale
+        # scores: (N, nheads, k)
+
+        # Apply mask if provided
+        if mask is not None:
+            # mask: (N, k) -> (N, 1, k)
+            scores = scores.masked_fill(mask.unsqueeze(1), float('-inf'))
+
+        # Softmax over k neighbors
+        weights = F.softmax(scores, dim=-1)  # (N, nheads, k)
         weights = self.dropout(weights)
 
-        # Apply bias and mask
-        if bias is not None:
-            weights = weights + bias
-        if mask is not None:
-            weights = weights * mask[:, None]
+        # Weighted sum of neighbor values: (N, nheads, head_dim)
+        # weights: (N, nheads, k) -> (N, nheads, 1, k)
+        # neighbor_values: (N, nheads, k, head_dim)
+        output = (weights.unsqueeze(2) @ neighbor_values).squeeze(2)
 
-        # Compute weighted values and aggregate
-        values = weights[..., None] * values
-        output = dgl.ops.copy_e_sum(graph, values)
-
-        return output.view(graph.num_nodes(), self.hidden_size)
+        # Reshape back: (N, hidden_size)
+        return output.view(N, self.hidden_size)
 
 
-class EquivariantAttention(nn.Module):
-    """SE(3)-equivariant attention layer.
+class EquivariantDenseAttention(nn.Module):
+    """SE(3)-equivariant dense (all-to-all) attention.
 
-    Combines equivariant convolution with graph attention to
-    compute equivariant message passing with attention.
+    Combines equivariant convolution with dense attention to compute
+    equivariant message passing over all pairs of nodes.
 
     Args:
         repr: ProductRepr specifying representations.
@@ -566,13 +678,10 @@ class EquivariantAttention(nn.Module):
         nheads: Number of attention heads.
         dropout: Dropout for convolution.
         attn_dropout: Dropout for attention weights.
-
-    Raises:
-        ImportError: If DGL is not installed.
     """
 
     def __init__(
-        self: EquivariantAttention,
+        self: EquivariantDenseAttention,
         repr: ProductRepr,
         edge_dim: int,
         edge_hidden_dim: int,
@@ -582,11 +691,7 @@ class EquivariantAttention(nn.Module):
     ) -> None:
         super().__init__()
 
-        if not is_dgl_available():
-            raise ImportError(
-                "DGL is required for EquivariantAttention. "
-                "Install with: pip install dgl"
-            )
+        self.repr = repr
 
         # Create representation for keys, queries, values (3x output mult)
         repr_h = deepcopy(repr)
@@ -596,7 +701,7 @@ class EquivariantAttention(nn.Module):
             repr_h, edge_dim, edge_hidden_dim, dropout
         )
 
-        self.attn = GraphAttention(
+        self.attn = DenseAttention(
             repr.rep2.mult * repr.rep2.dim(),
             nheads,
             attn_dropout,
@@ -606,45 +711,163 @@ class EquivariantAttention(nn.Module):
         self.outdims = (repr.rep2.mult, repr.rep2.dim())
 
     def forward(
-        self: EquivariantAttention,
-        graph: Any,
+        self: EquivariantDenseAttention,
         basis: tuple[torch.Tensor, torch.Tensor],
         edge_feats: torch.Tensor,
         f: torch.Tensor,
         mask: torch.Tensor | None = None,
-        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply equivariant attention.
+        """Apply equivariant dense attention.
 
         Args:
-            graph: DGL graph.
-            basis: Equivariant basis matrices.
-            edge_feats: Edge features of shape (E, edge_dim).
+            basis: Equivariant basis matrices of shape (N, N, ...).
+            edge_feats: Edge features of shape (N, N, edge_dim).
             f: Node features of shape (N, mult, dim).
-            mask: Optional edge mask.
-            bias: Optional attention bias.
+            mask: Optional attention mask of shape (N, N).
 
         Returns:
             Updated node features of shape (N, mult, dim).
         """
-        src, _ = graph.edges()
+        N = f.size(0)
+
+        # Create source indices for all pairs: (N, N) -> (N*N,)
+        src_idx = torch.arange(N, device=f.device).unsqueeze(0).expand(N, -1).flatten()
+
+        # Flatten basis and edge_feats for convolution
+        b1, b2 = basis
+        b1_flat = b1.view(N * N, *b1.shape[2:])
+        b2_flat = b2.view(N * N, *b2.shape[2:])
+        edge_feats_flat = edge_feats.view(N * N, -1)
 
         # Equivariant convolution to get keys, queries, values
-        conv = self.conv(basis, edge_feats, f, src)
-        k, q, v = torch.chunk(conv.flatten(-2, -1), 3, dim=-1)
+        conv = self.conv((b1_flat, b2_flat), edge_feats_flat, f, src_idx)
+        # conv shape: (N*N, 3*mult, dim)
+        conv = conv.view(N, N, 3 * self.outdims[0], self.outdims[1])  # (N, N, 3*mult, dim)
 
-        # Graph attention
-        attn_out = self.attn(graph, k, q, v, mask, bias)
+        # Extract k, q, v and aggregate
+        # For dense attention, we need node-level k, q, v
+        # Average over source dimension to get per-node representations
+        conv_flat = conv.flatten(-2, -1)  # (N, N, 3*mult*dim)
+        k, q, v = torch.chunk(conv_flat, 3, dim=-1)  # each (N, N, mult*dim)
+
+        # Aggregate: take mean over source nodes for keys/values
+        k_node = k.mean(dim=1)  # (N, hidden)
+        q_node = q.mean(dim=0)  # (N, hidden) - mean over targets
+        v_node = v.mean(dim=1)  # (N, hidden)
+
+        # Apply dense attention
+        attn_out = self.attn(k_node, q_node, v_node, mask)
 
         # Reshape and project
-        attn_out = attn_out.view(graph.num_nodes(), *self.outdims)
+        attn_out = attn_out.view(N, *self.outdims)
         return self.proj(attn_out)
 
 
-class EquivariantTransformerBlock(nn.Module):
-    """Single block of an equivariant transformer.
+class EquivariantSparseAttention(nn.Module):
+    """SE(3)-equivariant sparse (k-NN) attention.
 
-    Combines equivariant attention with optional transition layer,
+    Combines equivariant convolution with sparse k-NN attention to
+    compute equivariant message passing over local neighborhoods.
+
+    Args:
+        repr: ProductRepr specifying representations.
+        edge_dim: Dimension of invariant edge features.
+        edge_hidden_dim: Hidden dimension for radial networks.
+        nheads: Number of attention heads.
+        dropout: Dropout for convolution.
+        attn_dropout: Dropout for attention weights.
+    """
+
+    def __init__(
+        self: EquivariantSparseAttention,
+        repr: ProductRepr,
+        edge_dim: int,
+        edge_hidden_dim: int,
+        nheads: int = 1,
+        dropout: float = 0.0,
+        attn_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        self.repr = repr
+
+        # Create representation for keys, queries, values (3x output mult)
+        repr_h = deepcopy(repr)
+        repr_h.rep2.mult = 3 * repr.rep2.mult
+
+        self.conv = EquivariantConvolution(
+            repr_h, edge_dim, edge_hidden_dim, dropout
+        )
+
+        self.attn = SparseAttention(
+            repr.rep2.mult * repr.rep2.dim(),
+            nheads,
+            attn_dropout,
+        )
+
+        self.proj = EquivariantLinear(repr.rep2, repr.rep2, dropout, activation=None)
+        self.outdims = (repr.rep2.mult, repr.rep2.dim())
+
+    def forward(
+        self: EquivariantSparseAttention,
+        basis: tuple[torch.Tensor, torch.Tensor],
+        edge_feats: torch.Tensor,
+        f: torch.Tensor,
+        neighbor_idx: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply equivariant sparse attention.
+
+        Args:
+            basis: Equivariant basis matrices of shape (N, k, ...).
+            edge_feats: Edge features of shape (N, k, edge_dim).
+            f: Node features of shape (N, mult, dim).
+            neighbor_idx: Neighbor indices of shape (N, k).
+            mask: Optional attention mask of shape (N, k).
+
+        Returns:
+            Updated node features of shape (N, mult, dim).
+        """
+        N, k = neighbor_idx.shape
+
+        # Flatten neighbor dimension for convolution: (N*k,)
+        src_idx = neighbor_idx.flatten()
+
+        # Flatten basis and edge_feats
+        b1, b2 = basis
+        b1_flat = b1.view(N * k, *b1.shape[2:])
+        b2_flat = b2.view(N * k, *b2.shape[2:])
+        edge_feats_flat = edge_feats.view(N * k, -1)
+
+        # Equivariant convolution to get keys, queries, values per edge
+        conv = self.conv((b1_flat, b2_flat), edge_feats_flat, f, src_idx)
+        # conv shape: (N*k, 3*mult, dim)
+        conv = conv.view(N, k, 3 * self.outdims[0], self.outdims[1])  # (N, k, 3*mult, dim)
+
+        # Split into k, q, v
+        conv_flat = conv.flatten(-2, -1)  # (N, k, 3*mult*dim)
+        k_edge, q_edge, v_edge = torch.chunk(conv_flat, 3, dim=-1)  # each (N, k, mult*dim)
+
+        # For sparse attention:
+        # - keys and values come from neighbors (N, k, hidden) -> gather to (N, hidden)
+        # - queries are per-node
+        # We need node-level representations for attention
+        k_node = k_edge.mean(dim=1)  # (N, hidden)
+        q_node = q_edge.mean(dim=1)  # (N, hidden)
+        v_node = v_edge.mean(dim=1)  # (N, hidden)
+
+        # Apply sparse attention
+        attn_out = self.attn(k_node, q_node, v_node, neighbor_idx, mask)
+
+        # Reshape and project
+        attn_out = attn_out.view(N, *self.outdims)
+        return self.proj(attn_out)
+
+
+class EquivariantDenseTransformerBlock(nn.Module):
+    """Dense transformer block with all-to-all attention.
+
+    Combines equivariant dense attention with optional transition layer,
     layer normalization, and residual connections.
 
     Args:
@@ -655,13 +878,10 @@ class EquivariantTransformerBlock(nn.Module):
         dropout: Dropout probability.
         attn_dropout: Attention dropout probability.
         transition: Whether to include transition layer.
-
-    Raises:
-        ImportError: If DGL is not installed.
     """
 
     def __init__(
-        self: EquivariantTransformerBlock,
+        self: EquivariantDenseTransformerBlock,
         repr: ProductRepr,
         edge_dim: int,
         edge_hidden_dim: int,
@@ -672,15 +892,9 @@ class EquivariantTransformerBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        if not is_dgl_available():
-            raise ImportError(
-                "DGL is required for EquivariantTransformerBlock. "
-                "Install with: pip install dgl"
-            )
-
         self.prepr = repr
 
-        self.attn = EquivariantAttention(
+        self.attn = EquivariantDenseAttention(
             repr, edge_dim, edge_hidden_dim, nheads, dropout, attn_dropout
         )
 
@@ -702,23 +916,19 @@ class EquivariantTransformerBlock(nn.Module):
             self.transition = None
 
     def forward(
-        self: EquivariantTransformerBlock,
-        graph: Any,
+        self: EquivariantDenseTransformerBlock,
         basis: tuple[torch.Tensor, torch.Tensor],
         features: torch.Tensor,
         edge_feats: torch.Tensor,
         mask: torch.Tensor | None = None,
-        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply transformer block.
+        """Apply dense transformer block.
 
         Args:
-            graph: DGL graph.
-            basis: Equivariant basis matrices.
-            features: Node features.
-            edge_feats: Edge features.
-            mask: Optional edge mask.
-            bias: Optional attention bias.
+            basis: Equivariant basis matrices of shape (N, N, ...).
+            features: Node features of shape (N, mult, dim).
+            edge_feats: Edge features of shape (N, N, edge_dim).
+            mask: Optional attention mask of shape (N, N).
 
         Returns:
             Updated node features.
@@ -728,7 +938,99 @@ class EquivariantTransformerBlock(nn.Module):
             features_tmp = features
 
         features = self.ln1(features)
-        features = self.attn(graph, basis, edge_feats, features, mask, bias)
+        features = self.attn(basis, edge_feats, features, mask)
+
+        if self.skip:
+            features = features + features_tmp
+
+        if self.transition is not None:
+            if self.skip:
+                features_tmp = features
+            features = self.ln2(features)
+            features = self.transition(features)
+            if self.skip:
+                features = features + features_tmp
+
+        return features
+
+
+class EquivariantSparseTransformerBlock(nn.Module):
+    """Sparse transformer block with k-NN attention.
+
+    Combines equivariant sparse attention with optional transition layer,
+    layer normalization, and residual connections.
+
+    Args:
+        repr: ProductRepr for the block.
+        edge_dim: Edge feature dimension.
+        edge_hidden_dim: Hidden dimension for edge processing.
+        nheads: Number of attention heads.
+        dropout: Dropout probability.
+        attn_dropout: Attention dropout probability.
+        transition: Whether to include transition layer.
+    """
+
+    def __init__(
+        self: EquivariantSparseTransformerBlock,
+        repr: ProductRepr,
+        edge_dim: int,
+        edge_hidden_dim: int,
+        nheads: int = 1,
+        dropout: float = 0.0,
+        attn_dropout: float = 0.0,
+        transition: bool = False,
+    ) -> None:
+        super().__init__()
+
+        self.prepr = repr
+
+        self.attn = EquivariantSparseAttention(
+            repr, edge_dim, edge_hidden_dim, nheads, dropout, attn_dropout
+        )
+
+        self.ln1 = EquivariantLayerNorm(repr.rep1)
+
+        # Check if skip connection is possible
+        deg_match = repr.rep1.lvals == repr.rep2.lvals
+        mult_match = repr.rep1.mult == repr.rep2.mult
+        self.skip = deg_match and mult_match
+
+        # Optional transition layer
+        if transition:
+            self.ln2 = EquivariantLayerNorm(repr.rep2)
+            hidden_repr = deepcopy(repr.rep2)
+            hidden_repr.mult = repr.rep2.mult * 4
+            self.transition = EquivariantTransition(repr.rep2, hidden_repr)
+        else:
+            self.ln2 = None
+            self.transition = None
+
+    def forward(
+        self: EquivariantSparseTransformerBlock,
+        basis: tuple[torch.Tensor, torch.Tensor],
+        features: torch.Tensor,
+        edge_feats: torch.Tensor,
+        neighbor_idx: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply sparse transformer block.
+
+        Args:
+            basis: Equivariant basis matrices of shape (N, k, ...).
+            features: Node features of shape (N, mult, dim).
+            edge_feats: Edge features of shape (N, k, edge_dim).
+            neighbor_idx: Neighbor indices of shape (N, k).
+            mask: Optional attention mask of shape (N, k).
+
+        Returns:
+            Updated node features.
+        """
+        # Pre-LN transformer variant
+        if self.skip:
+            features_tmp = features
+
+        features = self.ln1(features)
+        features = self.attn(basis, edge_feats, features, neighbor_idx, mask)
 
         if self.skip:
             features = features + features_tmp
@@ -745,11 +1047,12 @@ class EquivariantTransformerBlock(nn.Module):
 
 
 class EquivariantTransformer(nn.Module):
-    """SE(3)-equivariant transformer for geometric graphs.
+    """SE(3)-equivariant transformer for geometric point clouds.
 
-    A full transformer architecture that processes geometric graphs
-    while maintaining SE(3) equivariance. Uses equivariant attention
-    and optional transition layers.
+    A full transformer architecture that processes 3D point clouds
+    while maintaining SE(3) equivariance. Supports two attention modes:
+    - Dense (k_neighbors=None): All-to-all attention, O(N^2) complexity
+    - Sparse (k_neighbors=int): k-NN attention, O(N*k) complexity
 
     Args:
         in_repr: Input representation.
@@ -762,20 +1065,22 @@ class EquivariantTransformer(nn.Module):
         dropout: Dropout probability.
         attn_dropout: Attention dropout probability.
         transition: Whether to include transition layers.
-
-    Raises:
-        ImportError: If DGL is not installed.
+        k_neighbors: Number of nearest neighbors for sparse attention.
+            If None, uses dense all-to-all attention.
 
     Example:
         >>> in_repr = Repr(lvals=[0, 1], mult=4)
         >>> out_repr = Repr(lvals=[0, 1], mult=1)
         >>> hidden_repr = Repr(lvals=[0, 1], mult=16)
+        >>> # Sparse attention with k=16 neighbors
         >>> model = EquivariantTransformer(
         ...     in_repr, out_repr, hidden_repr,
         ...     hidden_layers=4,
         ...     edge_dim=16,
         ...     edge_hidden_dim=32,
+        ...     k_neighbors=16,
         ... )
+        >>> output = model(coordinates, node_features)
     """
 
     def __init__(
@@ -790,14 +1095,9 @@ class EquivariantTransformer(nn.Module):
         dropout: float = 0.0,
         attn_dropout: float = 0.0,
         transition: bool = False,
+        k_neighbors: int | None = None,
     ) -> None:
         super().__init__()
-
-        if not is_dgl_available():
-            raise ImportError(
-                "DGL is required for EquivariantTransformer. "
-                "Install with: pip install dgl"
-            )
 
         self.edge_dim = edge_dim
         self.edge_hidden_dim = edge_hidden_dim
@@ -805,6 +1105,7 @@ class EquivariantTransformer(nn.Module):
         self.dropout = dropout
         self.attn_dropout = attn_dropout
         self.use_transition = transition
+        self.k_neighbors = k_neighbors
 
         self.in_repr = in_repr
         self.out_repr = out_repr
@@ -832,36 +1133,48 @@ class EquivariantTransformer(nn.Module):
         # Compute equivariant bases for all product representations
         self.bases = EquivariantBases(*preprs)
 
-    def _construct_layer(self: EquivariantTransformer, prepr: ProductRepr) -> EquivariantTransformerBlock:
+    def _construct_layer(
+        self: EquivariantTransformer,
+        prepr: ProductRepr,
+    ) -> EquivariantDenseTransformerBlock | EquivariantSparseTransformerBlock:
         """Construct a single transformer block."""
-        return EquivariantTransformerBlock(
-            prepr,
-            self.edge_dim,
-            self.edge_hidden_dim,
-            self.nheads,
-            self.dropout,
-            self.attn_dropout,
-            self.use_transition,
-        )
+        if self.k_neighbors is None:
+            return EquivariantDenseTransformerBlock(
+                prepr,
+                self.edge_dim,
+                self.edge_hidden_dim,
+                self.nheads,
+                self.dropout,
+                self.attn_dropout,
+                self.use_transition,
+            )
+        else:
+            return EquivariantSparseTransformerBlock(
+                prepr,
+                self.edge_dim,
+                self.edge_hidden_dim,
+                self.nheads,
+                self.dropout,
+                self.attn_dropout,
+                self.use_transition,
+            )
 
     def forward(
         self: EquivariantTransformer,
-        graph: Any,
         coordinates: torch.Tensor,
         node_features: torch.Tensor,
-        edge_features: torch.Tensor,
+        edge_features: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
-        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply equivariant transformer.
 
         Args:
-            graph: DGL graph.
             coordinates: Node coordinates of shape (N, 3).
             node_features: Node features of shape (N, mult, dim).
-            edge_features: Edge features of shape (E, edge_dim).
-            mask: Optional edge mask.
-            bias: Optional attention bias.
+            edge_features: Optional edge features. For sparse mode, shape (N, k, edge_dim).
+                For dense mode, shape (N, N, edge_dim). If None, uses distances.
+            mask: Optional attention mask. For sparse mode, shape (N, k).
+                For dense mode, shape (N, N).
 
         Returns:
             Output features of shape (N, out_mult, out_dim).
@@ -875,14 +1188,49 @@ class EquivariantTransformer(nn.Module):
                 f"input representation (mult={self.in_repr.mult}, dim={self.in_repr.dim()})"
             )
 
-        # Compute basis elements from edge displacements
-        src, dst = graph.edges()
-        displacements = coordinates[src] - coordinates[dst]
-        bases = self.bases(displacements)
+        N = coordinates.size(0)
 
-        # Pass through transformer layers
-        for layer, basis in zip(self.layers, bases):
-            node_features = layer(graph, basis, node_features, edge_features, mask, bias)
+        if self.k_neighbors is not None:
+            # Sparse mode: k-NN attention
+            neighbor_idx = build_knn_graph(coordinates, self.k_neighbors)
+            k = neighbor_idx.size(1)
+
+            # Compute displacements for (N, k) neighbor pairs
+            neighbor_coords = coordinates[neighbor_idx]  # (N, k, 3)
+            displacements = coordinates.unsqueeze(1) - neighbor_coords  # (N, k, 3)
+
+            # Compute edge features from distances if not provided
+            if edge_features is None:
+                distances = displacements.norm(dim=-1, keepdim=True)  # (N, k, 1)
+                edge_features = distances.expand(-1, -1, self.edge_dim)
+
+            # Compute all bases at once
+            all_bases_flat = self.bases(displacements.view(N * k, 3))
+
+            # Reshape bases for (N, k, ...) structure and pass through layers
+            for layer, (b1, b2) in zip(self.layers, all_bases_flat):
+                b1 = b1.view(N, k, *b1.shape[1:])
+                b2 = b2.view(N, k, *b2.shape[1:])
+                node_features = layer((b1, b2), node_features, edge_features, neighbor_idx, mask)
+
+        else:
+            # Dense mode: all-to-all attention
+            # Compute displacements for all (N, N) pairs
+            displacements = coordinates.unsqueeze(1) - coordinates.unsqueeze(0)  # (N, N, 3)
+
+            # Compute edge features from distances if not provided
+            if edge_features is None:
+                distances = displacements.norm(dim=-1, keepdim=True)  # (N, N, 1)
+                edge_features = distances.expand(-1, -1, self.edge_dim)
+
+            # Compute all bases at once
+            all_bases_flat = self.bases(displacements.view(N * N, 3))
+
+            # Reshape bases for (N, N, ...) structure and pass through layers
+            for layer, (b1, b2) in zip(self.layers, all_bases_flat):
+                b1 = b1.view(N, N, *b1.shape[1:])
+                b2 = b2.view(N, N, *b2.shape[1:])
+                node_features = layer((b1, b2), node_features, edge_features, mask)
 
         # Output projection
         return self.proj(node_features)
