@@ -441,72 +441,17 @@ class TestEquivariantTransition:
 
 
 # ============================================================================
-# DENSEATTENTION TESTS
+# ATTENTION TESTS
 # ============================================================================
 
-class TestDenseAttention:
-    """Tests for DenseAttention layer."""
-
-    def test_forward_shape(self, num_nodes):
-        """Test output shape is (num_nodes, hidden_size)."""
-        hidden_size = 64
-        nheads = 4
-        layer = lg.DenseAttention(hidden_size, nheads)
-
-        keys = torch.randn(num_nodes, hidden_size)
-        queries = torch.randn(num_nodes, hidden_size)
-        values = torch.randn(num_nodes, hidden_size)
-
-        output = layer(keys, queries, values)
-        assert output.shape == (num_nodes, hidden_size)
-
-    def test_forward_no_nan(self, num_nodes):
-        """Test output contains no NaN values."""
-        hidden_size = 64
-        layer = lg.DenseAttention(hidden_size, nheads=4)
-
-        keys = torch.randn(num_nodes, hidden_size)
-        queries = torch.randn(num_nodes, hidden_size)
-        values = torch.randn(num_nodes, hidden_size)
-
-        output = layer(keys, queries, values)
-        assert not torch.isnan(output).any()
-
-    def test_backward_gradients(self, num_nodes):
-        """Test gradients flow correctly."""
-        hidden_size = 64
-        layer = lg.DenseAttention(hidden_size, nheads=4)
-
-        keys = torch.randn(num_nodes, hidden_size, requires_grad=True)
-        queries = torch.randn(num_nodes, hidden_size, requires_grad=True)
-        values = torch.randn(num_nodes, hidden_size, requires_grad=True)
-
-        output = layer(keys, queries, values)
-        loss = output.sum()
-        loss.backward()
-
-        assert keys.grad is not None
-        assert queries.grad is not None
-        assert values.grad is not None
-
-    def test_hidden_size_nheads_divisibility(self):
-        """Test that hidden_size must be divisible by nheads."""
-        with pytest.raises(ValueError, match="divisible"):
-            lg.DenseAttention(hidden_size=65, nheads=4)
-
-
-# ============================================================================
-# SPARSEATTENTION TESTS
-# ============================================================================
-
-class TestSparseAttention:
-    """Tests for SparseAttention layer."""
+class TestAttention:
+    """Tests for Attention layer (k-NN based)."""
 
     def test_forward_shape(self, num_nodes, k_neighbors, neighbor_idx):
         """Test output shape is (num_nodes, hidden_size)."""
         hidden_size = 64
         nheads = 4
-        layer = lg.SparseAttention(hidden_size, nheads)
+        layer = lg.Attention(hidden_size, nheads)
 
         keys = torch.randn(num_nodes, hidden_size)
         queries = torch.randn(num_nodes, hidden_size)
@@ -518,7 +463,7 @@ class TestSparseAttention:
     def test_forward_no_nan(self, num_nodes, neighbor_idx):
         """Test output contains no NaN values."""
         hidden_size = 64
-        layer = lg.SparseAttention(hidden_size, nheads=4)
+        layer = lg.Attention(hidden_size, nheads=4)
 
         keys = torch.randn(num_nodes, hidden_size)
         queries = torch.randn(num_nodes, hidden_size)
@@ -530,7 +475,7 @@ class TestSparseAttention:
     def test_backward_gradients(self, num_nodes, neighbor_idx):
         """Test gradients flow correctly."""
         hidden_size = 64
-        layer = lg.SparseAttention(hidden_size, nheads=4)
+        layer = lg.Attention(hidden_size, nheads=4)
 
         keys = torch.randn(num_nodes, hidden_size, requires_grad=True)
         queries = torch.randn(num_nodes, hidden_size, requires_grad=True)
@@ -547,7 +492,7 @@ class TestSparseAttention:
     def test_hidden_size_nheads_divisibility(self):
         """Test that hidden_size must be divisible by nheads."""
         with pytest.raises(ValueError, match="divisible"):
-            lg.SparseAttention(hidden_size=65, nheads=4)
+            lg.Attention(hidden_size=65, nheads=4)
 
 
 # ============================================================================
@@ -556,11 +501,11 @@ class TestSparseAttention:
 
 @requires_sphericart
 class TestEquivariantTransformer:
-    """Tests for EquivariantTransformer model (both dense and sparse modes)."""
+    """Tests for EquivariantTransformer model."""
 
     @pytest.fixture
-    def transformer_sparse_setup(self, num_nodes, edge_dim, hidden_dim, k_neighbors):
-        """Setup for sparse transformer tests."""
+    def transformer_setup(self, num_nodes, edge_dim, hidden_dim, k_neighbors):
+        """Setup for transformer tests."""
         in_repr = lg.Repr(lvals=[0, 1], mult=4)
         out_repr = lg.Repr(lvals=[0, 1], mult=2)
         hidden_repr = lg.Repr(lvals=[0, 1], mult=8)
@@ -572,45 +517,11 @@ class TestEquivariantTransformer:
             hidden_layers=2,
             edge_dim=edge_dim,
             edge_hidden_dim=hidden_dim,
-            nheads=4,
-            dropout=0.0,
-            attn_dropout=0.0,
-            transition=True,
             k_neighbors=k_neighbors,
-        )
-
-        coordinates = torch.randn(num_nodes, 3)
-        node_features = torch.randn(num_nodes, in_repr.mult, in_repr.dim())
-
-        return {
-            'model': model,
-            'coordinates': coordinates,
-            'node_features': node_features,
-            'in_repr': in_repr,
-            'out_repr': out_repr,
-        }
-
-    @pytest.fixture
-    def transformer_dense_setup(self, edge_dim, hidden_dim):
-        """Setup for dense transformer tests (use fewer nodes due to O(N^2))."""
-        num_nodes = 20  # Smaller for dense mode
-
-        in_repr = lg.Repr(lvals=[0, 1], mult=4)
-        out_repr = lg.Repr(lvals=[0, 1], mult=2)
-        hidden_repr = lg.Repr(lvals=[0, 1], mult=8)
-
-        model = lg.EquivariantTransformer(
-            in_repr=in_repr,
-            out_repr=out_repr,
-            hidden_repr=hidden_repr,
-            hidden_layers=2,
-            edge_dim=edge_dim,
-            edge_hidden_dim=hidden_dim,
             nheads=4,
             dropout=0.0,
             attn_dropout=0.0,
             transition=True,
-            k_neighbors=None,  # Dense mode
         )
 
         coordinates = torch.randn(num_nodes, 3)
@@ -622,12 +533,11 @@ class TestEquivariantTransformer:
             'node_features': node_features,
             'in_repr': in_repr,
             'out_repr': out_repr,
-            'num_nodes': num_nodes,
         }
 
-    def test_sparse_forward_shape(self, transformer_sparse_setup, num_nodes):
-        """Test sparse transformer output shape matches out_repr."""
-        setup = transformer_sparse_setup
+    def test_forward_shape(self, transformer_setup, num_nodes):
+        """Test transformer output shape matches out_repr."""
+        setup = transformer_setup
         output = setup['model'](
             setup['coordinates'],
             setup['node_features'],
@@ -635,37 +545,18 @@ class TestEquivariantTransformer:
         expected_shape = (num_nodes, setup['out_repr'].mult, setup['out_repr'].dim())
         assert output.shape == expected_shape
 
-    def test_sparse_forward_no_nan(self, transformer_sparse_setup):
-        """Test sparse transformer output contains no NaN values."""
-        setup = transformer_sparse_setup
+    def test_forward_no_nan(self, transformer_setup):
+        """Test transformer output contains no NaN values."""
+        setup = transformer_setup
         output = setup['model'](
             setup['coordinates'],
             setup['node_features'],
         )
         assert not torch.isnan(output).any()
 
-    def test_dense_forward_shape(self, transformer_dense_setup):
-        """Test dense transformer output shape matches out_repr."""
-        setup = transformer_dense_setup
-        output = setup['model'](
-            setup['coordinates'],
-            setup['node_features'],
-        )
-        expected_shape = (setup['num_nodes'], setup['out_repr'].mult, setup['out_repr'].dim())
-        assert output.shape == expected_shape
-
-    def test_dense_forward_no_nan(self, transformer_dense_setup):
-        """Test dense transformer output contains no NaN values."""
-        setup = transformer_dense_setup
-        output = setup['model'](
-            setup['coordinates'],
-            setup['node_features'],
-        )
-        assert not torch.isnan(output).any()
-
-    def test_invalid_input_shape_raises(self, transformer_sparse_setup):
+    def test_invalid_input_shape_raises(self, transformer_setup):
         """Test that mismatched input shape raises ValueError."""
-        setup = transformer_sparse_setup
+        setup = transformer_setup
         wrong_features = torch.randn(setup['node_features'].size(0), 100, 100)
 
         with pytest.raises(ValueError, match="does not match"):
@@ -674,9 +565,9 @@ class TestEquivariantTransformer:
                 wrong_features,
             )
 
-    def test_backward_gradients_sparse(self, transformer_sparse_setup):
-        """Test gradients flow correctly through sparse transformer."""
-        setup = transformer_sparse_setup
+    def test_backward_gradients(self, transformer_setup):
+        """Test gradients flow correctly through transformer."""
+        setup = transformer_setup
         node_features = setup['node_features'].clone().requires_grad_(True)
         coordinates = setup['coordinates'].clone().requires_grad_(True)
 
@@ -689,24 +580,9 @@ class TestEquivariantTransformer:
 
         assert node_features.grad is not None
 
-    def test_backward_gradients_dense(self, transformer_dense_setup):
-        """Test gradients flow correctly through dense transformer."""
-        setup = transformer_dense_setup
-        node_features = setup['node_features'].clone().requires_grad_(True)
-        coordinates = setup['coordinates'].clone().requires_grad_(True)
-
-        output = setup['model'](
-            coordinates,
-            node_features,
-        )
-        loss = output.sum()
-        loss.backward()
-
-        assert node_features.grad is not None
-
-    def test_optimizer_step(self, transformer_sparse_setup):
+    def test_optimizer_step(self, transformer_setup):
         """Test that model parameters update after optimizer step."""
-        setup = transformer_sparse_setup
+        setup = transformer_setup
         model = setup['model']
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
 
