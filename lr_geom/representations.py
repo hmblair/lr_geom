@@ -74,6 +74,11 @@ class Irrep:
         l: int,
         mult: int = 1,
     ) -> None:
+        if not isinstance(l, int) or l < 0:
+            raise ValueError(f"Degree l must be a non-negative integer, got {l}")
+        if not isinstance(mult, int) or mult < 1:
+            raise ValueError(f"Multiplicity must be a positive integer, got {mult}")
+
         self.l = l
         self.mult = mult
         self.real_dtype = torch.float32
@@ -87,6 +92,10 @@ class Irrep:
         if not isinstance(other, Irrep):
             return False
         return self.l == other.l and self.mult == other.mult
+
+    def __hash__(self: Irrep) -> int:
+        """Return hash based on degree and multiplicity."""
+        return hash((self.l, self.mult))
 
     def dim(self: Irrep) -> int:
         """Return the dimension of the representation (2l+1)."""
@@ -300,6 +309,14 @@ class Repr(nn.Module):
         if lvals is None:
             lvals = [1]
 
+        if not isinstance(lvals, (list, tuple)):
+            raise TypeError(f"lvals must be a list or tuple, got {type(lvals).__name__}")
+        if len(lvals) == 0:
+            raise ValueError("lvals must contain at least one degree")
+        if not isinstance(mult, int) or mult < 1:
+            raise ValueError(f"Multiplicity must be a positive integer, got {mult}")
+
+        # Irrep validation will catch invalid l values
         self.irreps = [Irrep(l, mult) for l in lvals]
         self.lvals = [irrep.l for irrep in self.irreps]
         self.mult = mult
@@ -318,6 +335,16 @@ class Repr(nn.Module):
     def __iter__(self: Repr) -> Generator[Irrep, None, None]:
         """Iterate over the irreducible representations."""
         yield from self.irreps
+
+    def __eq__(self: Repr, other: Any) -> bool:
+        """Check if representations have the same lvals and multiplicity."""
+        if not isinstance(other, Repr):
+            return False
+        return self.lvals == other.lvals and self.mult == other.mult
+
+    def __hash__(self: Repr) -> int:
+        """Return hash based on lvals and multiplicity."""
+        return hash((tuple(self.lvals), self.mult))
 
     def dim(self: Repr) -> int:
         """Get total dimension of the representation."""
@@ -570,6 +597,10 @@ class ProductRepr:
         if not isinstance(other, ProductRepr):
             return False
         return self.rep1 == other.rep1 and self.rep2 == other.rep2
+
+    def __hash__(self: ProductRepr) -> int:
+        """Return hash based on component representations."""
+        return hash((hash(self.rep1), hash(self.rep2)))
 
     def lmax(self: ProductRepr) -> int:
         """Get the largest degree in the decomposition."""

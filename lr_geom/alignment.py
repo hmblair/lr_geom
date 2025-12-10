@@ -7,9 +7,9 @@ Functions:
     rmsd: Compute root mean square deviation between point clouds
     get_kabsch_rotation_matrix: Find optimal rotation matrix
     kabsch_align: Align two point clouds
-    _laplacian: Compute graph Laplacian
-    _gnm_correlations: Compute Gaussian Network Model correlations
-    _gnm_variances: Compute GNM position variances
+    graph_laplacian: Compute graph Laplacian
+    gnm_correlations: Compute Gaussian Network Model correlations
+    gnm_variances: Compute GNM position variances
 
 Classes:
     RMSD: nn.Module for computing alignment loss
@@ -71,7 +71,7 @@ def rmsd(
 
 def get_kabsch_rotation_matrix(
     x: torch.Tensor,
-    y: torch.Tensor | None = None,
+    y: torch.Tensor,
     weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Find the optimal rotation matrix using the Kabsch algorithm.
@@ -81,8 +81,7 @@ def get_kabsch_rotation_matrix(
 
     Args:
         x: Source point cloud of shape (..., N, D).
-        y: Target point cloud of shape (..., N, D). If None, aligns x
-            with the coordinate axes.
+        y: Target point cloud of shape (..., N, D).
         weight: Optional weights for each point, shape (..., N).
 
     Returns:
@@ -195,7 +194,7 @@ class RMSD(nn.Module):
         return ((input - target) ** 2).mean()
 
 
-def _laplacian(adj: torch.Tensor) -> torch.Tensor:
+def graph_laplacian(adj: torch.Tensor) -> torch.Tensor:
     """Compute the graph Laplacian (Kirchhoff matrix).
 
     The graph Laplacian is defined as L = D - A, where D is the
@@ -206,12 +205,16 @@ def _laplacian(adj: torch.Tensor) -> torch.Tensor:
 
     Returns:
         Laplacian matrix of shape (N, N).
+
+    Example:
+        >>> adj = torch.tensor([[0., 1., 1.], [1., 0., 1.], [1., 1., 0.]])
+        >>> L = graph_laplacian(adj)
     """
     deg = torch.diag(adj.sum(1))
     return deg - adj
 
 
-def _gnm_correlations(adj: torch.Tensor) -> torch.Tensor:
+def gnm_correlations(adj: torch.Tensor) -> torch.Tensor:
     """Compute correlations under a Gaussian Network Model.
 
     The GNM models molecular dynamics as a network of springs,
@@ -222,12 +225,16 @@ def _gnm_correlations(adj: torch.Tensor) -> torch.Tensor:
 
     Returns:
         Correlation matrix of shape (N, N).
+
+    Example:
+        >>> adj = torch.tensor([[0., 1., 1.], [1., 0., 1.], [1., 1., 0.]])
+        >>> corr = gnm_correlations(adj)
     """
-    lap = _laplacian(adj)
+    lap = graph_laplacian(adj)
     return torch.linalg.pinv(lap, rtol=1e-2)
 
 
-def _gnm_variances(adj: torch.Tensor) -> torch.Tensor:
+def gnm_variances(adj: torch.Tensor) -> torch.Tensor:
     """Compute position variances under a Gaussian Network Model.
 
     Returns the diagonal of the GNM correlation matrix, which
@@ -238,5 +245,9 @@ def _gnm_variances(adj: torch.Tensor) -> torch.Tensor:
 
     Returns:
         Variance vector of shape (N,).
+
+    Example:
+        >>> adj = torch.tensor([[0., 1., 1.], [1., 0., 1.], [1., 1., 0.]])
+        >>> var = gnm_variances(adj)
     """
-    return torch.diagonal(_gnm_correlations(adj))
+    return torch.diagonal(gnm_correlations(adj))

@@ -4,85 +4,26 @@ This module provides ready-to-use models built from geometric deep
 learning primitives.
 
 Classes:
-    RadialWeight: Neural network for computing tensor product weights
     GNMA: Gaussian Network Model Attention
+
+Note:
+    RadialWeight has been moved to layers.py but is re-exported here
+    for backward compatibility.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from .representations import ProductRepr
-from .alignment import _gnm_correlations
+from .alignment import gnm_correlations
 from .equivariant import RadialBasisFunctions
 from .nn import DenseNetwork
 
+# Re-export RadialWeight for backward compatibility
+# RadialWeight is now defined in layers.py as it's a primitive layer
+from .layers import RadialWeight
 
-class RadialWeight(nn.Module):
-    """Compute tensor product weights from invariant edge features.
-
-    A two-layer neural network that maps edge features to weights
-    for tensor product contractions. Used in equivariant message
-    passing networks.
-
-    Args:
-        edge_dim: Dimension of input edge features.
-        hidden_dim: Hidden layer dimension.
-        repr: ProductRepr specifying the tensor product structure.
-        in_dim: Input multiplicity.
-        out_dim: Output multiplicity.
-        dropout: Dropout probability.
-
-    Example:
-        >>> repr = ProductRepr(Repr([1]), Repr([1]))
-        >>> weight_net = RadialWeight(16, 32, repr, 8, 8)
-        >>> edge_features = torch.randn(100, 16)
-        >>> weights = weight_net(edge_features)
-    """
-
-    def __init__(
-        self: RadialWeight,
-        edge_dim: int,
-        hidden_dim: int,
-        repr: ProductRepr,
-        in_dim: int,
-        out_dim: int,
-        dropout: float = 0,
-    ) -> None:
-        super().__init__()
-
-        self.nl1 = repr.rep1.nreps()
-        self.nl2 = repr.rep2.nreps()
-
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.out_dim_flat = self.nl1 * self.nl2 * in_dim * out_dim
-
-        self.layer1 = nn.Linear(edge_dim, hidden_dim)
-        self.layer2 = nn.Linear(hidden_dim, self.out_dim_flat)
-
-        self.activation = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self: RadialWeight, x: torch.Tensor) -> torch.Tensor:
-        """Compute weights from edge features.
-
-        Args:
-            x: Edge features of shape (..., edge_dim).
-
-        Returns:
-            Weights of shape (..., nl2 * out_dim, nl1 * in_dim).
-        """
-        *b, _ = x.size()
-
-        x = self.layer1(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-
-        return self.layer2(x).view(
-            *b, self.nl2 * self.out_dim,
-            self.nl1 * self.in_dim,
-        )
+__all__ = ["RadialWeight", "GNMA"]
 
 
 class GNMA(nn.Module):
@@ -132,5 +73,5 @@ class GNMA(nn.Module):
         pw = torch.cdist(coords, coords)
         emb = self.embed(pw)
 
-        attn = _gnm_correlations(emb)
+        attn = gnm_correlations(emb)
         return torch.softmax(attn, 1) @ coords

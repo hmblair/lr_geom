@@ -1,11 +1,16 @@
 """Basic neural network building blocks.
 
 Simple utility layers used by geometric models.
+
+Classes:
+    DenseNetwork: Multi-layer perceptron with configurable architecture
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+
+__all__ = ["DenseNetwork"]
 
 
 class DenseNetwork(nn.Module):
@@ -36,6 +41,13 @@ class DenseNetwork(nn.Module):
     ) -> None:
         super().__init__()
 
+        if not isinstance(in_size, int) or in_size < 1:
+            raise ValueError(f"in_size must be a positive integer, got {in_size}")
+        if not isinstance(out_size, int) or out_size < 1:
+            raise ValueError(f"out_size must be a positive integer, got {out_size}")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {dropout}")
+
         if hidden_sizes is None:
             hidden_sizes = []
         if activation is None:
@@ -51,8 +63,15 @@ class DenseNetwork(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.activation = activation
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the network."""
+    def forward(self: DenseNetwork, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the network.
+
+        Args:
+            x: Input tensor of shape (..., in_size).
+
+        Returns:
+            Output tensor of shape (..., out_size).
+        """
         for layer in self.layers[:-1]:
             x = self.activation(layer(x))
             x = self.dropout(x)

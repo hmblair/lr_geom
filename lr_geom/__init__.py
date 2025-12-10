@@ -39,6 +39,9 @@ from .alignment import (
     get_kabsch_rotation_matrix,
     kabsch_align,
     RMSD,
+    graph_laplacian,
+    gnm_correlations,
+    gnm_variances,
 )
 
 # Representation theory
@@ -61,14 +64,12 @@ from .equivariant import (
 )
 
 # Models
-from .models import (
-    RadialWeight,
-    GNMA,
-)
+from .models import GNMA
 
 # Equivariant layers
 from .layers import (
     is_dgl_available,
+    RadialWeight,
     EquivariantLinear,
     EquivariantGating,
     EquivariantTransition,
@@ -91,6 +92,9 @@ __all__ = [
     "get_kabsch_rotation_matrix",
     "kabsch_align",
     "RMSD",
+    "graph_laplacian",
+    "gnm_correlations",
+    "gnm_variances",
     # Representations
     "Irrep",
     "ProductIrrep",
@@ -103,10 +107,10 @@ __all__ = [
     "EquivariantBasis",
     "EquivariantBases",
     # Models
-    "RadialWeight",
     "GNMA",
     # Layers
     "is_dgl_available",
+    "RadialWeight",
     "EquivariantLinear",
     "EquivariantGating",
     "EquivariantTransition",

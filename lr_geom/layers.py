@@ -9,6 +9,7 @@ DGL is an optional dependency - import will succeed but instantiating
 graph-based layers without DGL will raise ImportError.
 
 Classes:
+    RadialWeight: Neural network for computing tensor product weights
     EquivariantLinear: Linear layer preserving spherical tensor structure
     EquivariantGating: Norm-based gating for spherical tensors
     EquivariantTransition: MLP transition layer for spherical tensors
@@ -21,7 +22,7 @@ Classes:
 """
 from __future__ import annotations
 
-from copy import copy, deepcopy
+from copy import deepcopy
 from typing import Any
 
 import torch
@@ -29,7 +30,6 @@ import torch.nn as nn
 
 from .representations import Repr, ProductRepr
 from .equivariant import RepNorm, EquivariantBases, FEATURE_DIM
-from .models import RadialWeight
 
 # Lazy import for DGL
 _dgl: Any = None
@@ -55,6 +55,73 @@ def is_dgl_available() -> bool:
     """Check if DGL is installed and available."""
     _get_dgl()
     return _dgl_available or False
+
+
+class RadialWeight(nn.Module):
+    """Compute tensor product weights from invariant edge features.
+
+    A two-layer neural network that maps edge features to weights
+    for tensor product contractions. Used in equivariant message
+    passing networks.
+
+    Args:
+        edge_dim: Dimension of input edge features.
+        hidden_dim: Hidden layer dimension.
+        repr: ProductRepr specifying the tensor product structure.
+        in_dim: Input multiplicity.
+        out_dim: Output multiplicity.
+        dropout: Dropout probability.
+
+    Example:
+        >>> repr = ProductRepr(Repr([1]), Repr([1]))
+        >>> weight_net = RadialWeight(16, 32, repr, 8, 8)
+        >>> edge_features = torch.randn(100, 16)
+        >>> weights = weight_net(edge_features)
+    """
+
+    def __init__(
+        self: RadialWeight,
+        edge_dim: int,
+        hidden_dim: int,
+        repr: ProductRepr,
+        in_dim: int,
+        out_dim: int,
+        dropout: float = 0,
+    ) -> None:
+        super().__init__()
+
+        self.nl1 = repr.rep1.nreps()
+        self.nl2 = repr.rep2.nreps()
+
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.out_dim_flat = self.nl1 * self.nl2 * in_dim * out_dim
+
+        self.layer1 = nn.Linear(edge_dim, hidden_dim)
+        self.layer2 = nn.Linear(hidden_dim, self.out_dim_flat)
+
+        self.activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self: RadialWeight, x: torch.Tensor) -> torch.Tensor:
+        """Compute weights from edge features.
+
+        Args:
+            x: Edge features of shape (..., edge_dim).
+
+        Returns:
+            Weights of shape (..., nl2 * out_dim, nl1 * in_dim).
+        """
+        *b, _ = x.size()
+
+        x = self.layer1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+
+        return self.layer2(x).view(
+            *b, self.nl2 * self.out_dim,
+            self.nl1 * self.in_dim,
+        )
 
 
 class EquivariantLinear(nn.Module):
@@ -627,8 +694,8 @@ class EquivariantTransformerBlock(nn.Module):
         # Optional transition layer
         if transition:
             self.ln2 = EquivariantLayerNorm(repr.rep2)
-            hidden_repr = copy(repr.rep2)
-            hidden_repr.mult = hidden_repr.mult * 4
+            hidden_repr = deepcopy(repr.rep2)
+            hidden_repr.mult = repr.rep2.mult * 4
             self.transition = EquivariantTransition(repr.rep2, hidden_repr)
         else:
             self.ln2 = None
@@ -744,7 +811,7 @@ class EquivariantTransformer(nn.Module):
         self.hidden_repr = hidden_repr
 
         # Output projection
-        out_repr_tmp = copy(out_repr)
+        out_repr_tmp = deepcopy(out_repr)
         out_repr_tmp.mult = hidden_repr.mult
         self.proj = EquivariantLinear(out_repr_tmp, out_repr, activation=None, bias=True)
 
