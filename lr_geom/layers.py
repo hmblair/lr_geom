@@ -401,6 +401,12 @@ class EquivariantConvolution(nn.Module):
             dropout,
         )
 
+        # Learnable output scale to compensate for basis matrix attenuation
+        # The spherical harmonic basis for l=0 is 1/sqrt(4*pi) ≈ 0.28
+        # When we multiply f @ b1 @ rw @ b2, the signal is attenuated
+        # Initialize to compensate (value tuned empirically)
+        self.output_scale = nn.Parameter(torch.tensor(10.0))
+
     def forward(
         self: EquivariantConvolution,
         bases: tuple[torch.Tensor, torch.Tensor],
@@ -431,7 +437,7 @@ class EquivariantConvolution(nn.Module):
         # Apply convolution: f @ b1 -> rw @ ... -> ... @ b2
         tmp = (f_src @ b1).view(n_edges, -1, 1)
         tmp = (rw @ tmp).view(n_edges, -1, b2.size(1))
-        return tmp @ b2
+        return self.output_scale * (tmp @ b2)
 
 
 class EquivariantLayerNorm(nn.Module):
