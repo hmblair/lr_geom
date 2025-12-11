@@ -29,13 +29,19 @@ def diagnose():
     print("LOADING DATA")
     print("=" * 60)
 
-    data_dir = Path.home() / "academic/data/rna-libraries/pdb/structures/pdb130"
+    data_dir = Path.home() / "data/pdb130"
     structures = []
 
-    for cif_file in sorted(data_dir.glob("*.cif"))[:5]:
+    print(f"Looking in: {data_dir}")
+    cif_files = sorted(data_dir.glob("*.cif"))
+    print(f"Found {len(cif_files)} CIF files")
+
+    for cif_file in cif_files:
         try:
             polymer = ciffy.load(str(cif_file), backend="torch")
-            if polymer.size() > 500 or polymer.size() < 50:
+            n_atoms = polymer.size()
+            if n_atoms > 700 or n_atoms < 20:
+                print(f"  Skipping {cif_file.name}: {n_atoms} atoms (out of range)")
                 continue
             polymer, _ = polymer.center()
             coords = polymer.coordinates.float()
@@ -51,6 +57,7 @@ def diagnose():
             if len(structures) >= 1:
                 break
         except Exception as e:
+            print(f"  Error loading {cif_file.name}: {e}")
             continue
 
     if not structures:
