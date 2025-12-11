@@ -135,9 +135,14 @@ def diagnose():
     # Register hooks on key layers
     hooks = []
 
-    # Encoder layers
+    # Encoder layers - with detailed attention tracing
     for i, layer in enumerate(vae.encoder.layers):
         hooks.append(layer.ln1.register_forward_hook(make_hook(f"enc.layer{i}.ln1")))
+        # Detailed attention hooks
+        hooks.append(layer.attn.proj_q.register_forward_hook(make_hook(f"enc.layer{i}.attn.proj_q")))
+        hooks.append(layer.attn.conv_k.register_forward_hook(make_hook(f"enc.layer{i}.attn.conv_k")))
+        hooks.append(layer.attn.conv_v.register_forward_hook(make_hook(f"enc.layer{i}.attn.conv_v")))
+        hooks.append(layer.attn.out_proj.register_forward_hook(make_hook(f"enc.layer{i}.attn.out_proj")))
         hooks.append(layer.attn.register_forward_hook(make_hook(f"enc.layer{i}.attn")))
         if layer.transition is not None:
             hooks.append(layer.transition.register_forward_hook(make_hook(f"enc.layer{i}.transition")))
