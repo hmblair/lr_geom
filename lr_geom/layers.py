@@ -4,9 +4,7 @@ This module provides SE(3)-equivariant layers for building geometric
 deep learning models. These layers maintain equivariance to rotations
 and translations when processing 3D molecular or point cloud data.
 
-Supports two attention modes:
-- Dense: All-to-all attention using PyTorch's scaled_dot_product_attention
-- Sparse: k-NN based attention with regular (N, k) neighbor structure
+Uses k-NN based sparse attention with O(N*k) complexity.
 
 Classes:
     RadialWeight: Neural network for computing tensor product weights
@@ -15,12 +13,9 @@ Classes:
     EquivariantTransition: MLP transition layer for spherical tensors
     EquivariantConvolution: SE(3)-equivariant convolution
     EquivariantLayerNorm: Equivariant layer normalization
-    DenseAttention: All-to-all multi-head attention
-    SparseAttention: k-NN based multi-head attention
-    EquivariantDenseAttention: SE(3)-equivariant dense attention
-    EquivariantSparseAttention: SE(3)-equivariant sparse attention
-    EquivariantDenseTransformerBlock: Dense transformer block
-    EquivariantSparseTransformerBlock: Sparse transformer block
+    Attention: k-NN based multi-head attention
+    EquivariantAttention: SE(3)-equivariant sparse attention
+    EquivariantTransformerBlock: Transformer block with sparse attention
     EquivariantTransformer: Full equivariant transformer
 """
 from __future__ import annotations
@@ -32,7 +27,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .representations import Repr, ProductRepr
-from .equivariant import RepNorm, EquivariantBases, FEATURE_DIM
+from .equivariant import RepNorm, EquivariantBases, RadialBasisFunctions
+
+
+def _init_weights(module: nn.Module) -> None:
+    """Initialize weights using Xavier uniform for linear layers."""
+    if isinstance(module, nn.Linear):
+        nn.init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
 
 
 def build_knn_graph(coordinates: torch.Tensor, k: int) -> torch.Tensor:
@@ -124,8 +127,10 @@ class RadialWeight(nn.Module):
         self.layer1 = nn.Linear(edge_dim, hidden_dim)
         self.layer2 = nn.Linear(hidden_dim, self.out_dim_flat)
 
-        self.activation = nn.ReLU()
+        self.activation = nn.GELU()
         self.dropout = nn.Dropout(dropout)
+
+        self.apply(_init_weights)
 
     def forward(self: RadialWeight, x: torch.Tensor) -> torch.Tensor:
         """Compute weights from edge features.
@@ -193,8 +198,9 @@ class EquivariantLinear(nn.Module):
 
         # Weight matrix for linear transformation
         self.weight = nn.Parameter(
-            torch.randn(repr.nreps() * out_repr.mult, repr.mult)
+            torch.empty(repr.nreps() * out_repr.mult, repr.mult)
         )
+        nn.init.xavier_uniform_(self.weight)
 
         # Indices for gathering correct degrees
         indices = torch.tensor(repr.indices(), dtype=torch.long)
@@ -238,10 +244,12 @@ class EquivariantLinear(nn.Module):
         ix = self.indices.expand(*b, *self.expanddims)
         out = out.gather(dim=GATHER_DIM, index=ix).squeeze(GATHER_DIM)
 
-        # Add bias to scalar components
+        # Add bias and activation to scalar components
         if self.bias is not None:
-            view = out[..., self.scalar_locs]
-            out[..., self.scalar_locs] = self.activation(view + self.bias)
+            out = out.clone()
+            out[..., self.scalar_locs] = self.activation(
+                out[..., self.scalar_locs] + self.bias
+            )
 
         return out
 
@@ -286,6 +294,8 @@ class EquivariantGating(nn.Module):
         self.outdims = (repr.mult, repr.nreps())
         self.activation = nn.Sigmoid()
         self.dropout = nn.Dropout(dropout)
+
+        self.apply(_init_weights)
 
     def forward(self: EquivariantGating, st: torch.Tensor) -> torch.Tensor:
         """Apply gating to spherical tensor.
@@ -452,7 +462,6 @@ class EquivariantLayerNorm(nn.Module):
 
         self.norm = RepNorm(repr)
         self.lnorm = nn.LayerNorm(repr.mult)
-        self.nonlinearity = nn.Identity()
         self.epsilon = epsilon
 
         self.register_buffer('ix', torch.tensor(repr.indices(), dtype=torch.long))
@@ -472,7 +481,6 @@ class EquivariantLayerNorm(nn.Module):
 
         # Apply LayerNorm across multiplicity
         lnorms = self.lnorm(norms.view(-1, d, h)).view(*b, h, d)
-        lnorms = self.nonlinearity(lnorms)
 
         # Renormalize features
         norms_r = lnorms / (norms + self.epsilon)
@@ -581,8 +589,15 @@ class Attention(nn.Module):
 class EquivariantAttention(nn.Module):
     """SE(3)-equivariant k-NN attention.
 
-    Combines equivariant convolution with k-NN attention to
-    compute equivariant message passing over local neighborhoods.
+    Computes Q, K, V as edge features via equivariant convolution. Attention
+    weights are computed per-edge from Q · K, then used to weight edge-level
+    values before aggregating to nodes.
+
+    Flow:
+        1. Q, K, V = conv(neighbor_features, edge_geometry) -> edge features
+        2. scores = Q · K (per-edge dot product)
+        3. attention = softmax(scores) over neighbors
+        4. output = sum over neighbors of (attention * V)
 
     Args:
         repr: ProductRepr specifying representations.
@@ -605,23 +620,31 @@ class EquivariantAttention(nn.Module):
         super().__init__()
 
         self.repr = repr
+        self.nheads = nheads
 
-        # Create representation for keys, queries, values (3x output mult)
-        repr_h = deepcopy(repr)
-        repr_h.rep2.mult = 3 * repr.rep2.mult
+        out_mult = repr.rep2.mult
+        out_dim = repr.rep2.dim()
+        self.out_mult = out_mult
+        self.out_dim = out_dim
+        self.hidden_size = out_mult * out_dim
 
-        self.conv = EquivariantConvolution(
-            repr_h, edge_dim, edge_hidden_dim, dropout
-        )
+        if self.hidden_size % nheads != 0:
+            raise ValueError(
+                f"hidden_size ({self.hidden_size}) must be divisible by nheads ({nheads})"
+            )
 
-        self.attn = Attention(
-            repr.rep2.mult * repr.rep2.dim(),
-            nheads,
-            attn_dropout,
-        )
+        self.head_dim = self.hidden_size // nheads
+        self.scale = self.head_dim ** -0.5
 
-        self.proj = EquivariantLinear(repr.rep2, repr.rep2, dropout, activation=None)
-        self.outdims = (repr.rep2.mult, repr.rep2.dim())
+        # Q, K, V via equivariant convolution (all edge-level)
+        repr_qkv = deepcopy(repr)
+        repr_qkv.rep2.mult = 3 * out_mult  # Q, K, V concatenated
+        self.conv_qkv = EquivariantConvolution(repr_qkv, edge_dim, edge_hidden_dim, dropout)
+
+        # Output projection
+        self.out_proj = EquivariantLinear(repr.rep2, repr.rep2, activation=None)
+
+        self.attn_dropout = nn.Dropout(attn_dropout)
 
     def forward(
         self: EquivariantAttention,
@@ -645,38 +668,53 @@ class EquivariantAttention(nn.Module):
         """
         N, k = neighbor_idx.shape
 
-        # Flatten neighbor dimension for convolution: (N*k,)
-        src_idx = neighbor_idx.flatten()
-
-        # Flatten basis and edge_feats
+        # Flatten for convolution
+        src_idx = neighbor_idx.flatten()  # (N*k,)
         b1, b2 = basis
         b1_flat = b1.view(N * k, *b1.shape[2:])
         b2_flat = b2.view(N * k, *b2.shape[2:])
         edge_feats_flat = edge_feats.view(N * k, -1)
 
-        # Equivariant convolution to get keys, queries, values per edge
-        conv = self.conv((b1_flat, b2_flat), edge_feats_flat, f, src_idx)
-        # conv shape: (N*k, 3*mult, dim)
-        conv = conv.view(N, k, 3 * self.outdims[0], self.outdims[1])  # (N, k, 3*mult, dim)
+        # Compute Q, K, V as edge features via equivariant convolution
+        qkv = self.conv_qkv((b1_flat, b2_flat), edge_feats_flat, f, src_idx)
+        # qkv shape: (N*k, 3*out_mult, out_dim)
+        qkv = qkv.view(N, k, 3 * self.out_mult, self.out_dim)
 
-        # Split into k, q, v
-        conv_flat = conv.flatten(-2, -1)  # (N, k, 3*mult*dim)
-        k_edge, q_edge, v_edge = torch.chunk(conv_flat, 3, dim=-1)  # each (N, k, mult*dim)
+        # Split into Q, K, V: each (N, k, out_mult, out_dim)
+        queries, keys, values = qkv.chunk(3, dim=2)
 
-        # For sparse attention:
-        # - keys and values come from neighbors (N, k, hidden) -> gather to (N, hidden)
-        # - queries are per-node
-        # We need node-level representations for attention
-        k_node = k_edge.mean(dim=1)  # (N, hidden)
-        q_node = q_edge.mean(dim=1)  # (N, hidden)
-        v_node = v_edge.mean(dim=1)  # (N, hidden)
+        # Reshape for multi-head attention: (N, k, nheads, head_dim)
+        q_heads = queries.flatten(-2, -1).view(N, k, self.nheads, self.head_dim)
+        k_heads = keys.flatten(-2, -1).view(N, k, self.nheads, self.head_dim)
+        v_heads = values.flatten(-2, -1).view(N, k, self.nheads, self.head_dim)
 
-        # Apply sparse attention
-        attn_out = self.attn(k_node, q_node, v_node, neighbor_idx, mask)
+        # Transpose to (N, nheads, k, head_dim)
+        q_heads = q_heads.transpose(1, 2)
+        k_heads = k_heads.transpose(1, 2)
+        v_heads = v_heads.transpose(1, 2)
 
-        # Reshape and project
-        attn_out = attn_out.view(N, *self.outdims)
-        return self.proj(attn_out)
+        # Edge attention scores: element-wise Q · K, sum over head_dim
+        # (N, nheads, k, head_dim) * (N, nheads, k, head_dim) -> sum -> (N, nheads, k)
+        scores = (q_heads * k_heads).sum(dim=-1) * self.scale
+
+        # Apply mask
+        if mask is not None:
+            scores = scores.masked_fill(mask.unsqueeze(1), float('-inf'))
+
+        # Softmax over neighbors for each node
+        attn_weights = F.softmax(scores, dim=-1)  # (N, nheads, k)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Weight edge values by attention and aggregate over edges
+        # attn_weights: (N, nheads, k, 1)
+        # v_heads: (N, nheads, k, head_dim)
+        weighted = attn_weights.unsqueeze(-1) * v_heads  # (N, nheads, k, head_dim)
+        output = weighted.sum(dim=2)  # (N, nheads, head_dim)
+
+        # Reshape back to (N, out_mult, out_dim)
+        output = output.view(N, self.out_mult, self.out_dim)
+
+        return self.out_proj(output)
 
 
 class EquivariantTransformerBlock(nn.Module):
@@ -833,9 +871,10 @@ class EquivariantTransformer(nn.Module):
         self.out_repr = out_repr
         self.hidden_repr = hidden_repr
 
-        # Output projection
+        # Final layer norm and output projection
         out_repr_tmp = deepcopy(out_repr)
         out_repr_tmp.mult = hidden_repr.mult
+        self.final_ln = EquivariantLayerNorm(out_repr_tmp)
         self.proj = EquivariantLinear(out_repr_tmp, out_repr, activation=None, bias=True)
 
         # Build sequence of representations
@@ -854,6 +893,9 @@ class EquivariantTransformer(nn.Module):
 
         # Compute equivariant bases for all product representations
         self.bases = EquivariantBases(*preprs)
+
+        # Radial basis functions for edge features
+        self.rbf = RadialBasisFunctions(edge_dim)
 
     def _construct_layer(
         self: EquivariantTransformer,
@@ -908,10 +950,10 @@ class EquivariantTransformer(nn.Module):
         neighbor_coords = coordinates[neighbor_idx]  # (N, k, 3)
         displacements = coordinates.unsqueeze(1) - neighbor_coords  # (N, k, 3)
 
-        # Compute edge features from distances if not provided
+        # Compute edge features from distances using RBFs if not provided
         if edge_features is None:
-            distances = displacements.norm(dim=-1, keepdim=True)  # (N, k, 1)
-            edge_features = distances.expand(-1, -1, self.edge_dim)
+            distances = displacements.norm(dim=-1)  # (N, k)
+            edge_features = self.rbf(distances)  # (N, k, edge_dim)
 
         # Compute all bases at once
         all_bases_flat = self.bases(displacements.view(N * k, 3))
@@ -922,5 +964,6 @@ class EquivariantTransformer(nn.Module):
             b2 = b2.view(N, k, *b2.shape[1:])
             node_features = layer((b1, b2), node_features, edge_features, neighbor_idx, mask)
 
-        # Output projection
+        # Final layer norm and output projection
+        node_features = self.final_ln(node_features)
         return self.proj(node_features)
