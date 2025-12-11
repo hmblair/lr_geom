@@ -588,24 +588,30 @@ class Attention(nn.Module):
 
 
 class EquivariantAttention(nn.Module):
-    """SE(3)-equivariant k-NN attention.
+    """SE(3)-equivariant k-NN attention with standard attention pattern.
 
-    Computes Q, K, V as edge features via equivariant convolution. Attention
-    weights are computed per-edge from Q · K, then used to weight edge-level
-    values before aggregating to nodes.
+    Uses node-level queries with edge-level keys and values, following the
+    standard transformer attention pattern adapted for equivariance:
 
     Flow:
-        1. Q, K, V = conv(neighbor_features, edge_geometry) -> edge features
-        2. scores = Q · K (per-edge dot product)
-        3. attention = softmax(scores) over neighbors
-        4. output = sum over neighbors of (attention * V)
+        1. Q = linear(node_features)           # Node-level, keeps input lvals
+        2. K = conv(neighbor_features, edge)   # Edge-level, keeps input lvals
+        3. V = conv(neighbor_features, edge)   # Edge-level, can change lvals
+        4. scores = Q_i · K_ij                 # Standard Q·K attention
+        5. output = softmax(scores) @ V        # Weighted sum of values
+
+    Note on lval changes:
+        - Q uses EquivariantLinear, so must keep input lvals (rep1.lvals)
+        - K must match Q's lvals for the dot product to work
+        - V can change to output lvals (rep2.lvals) - this is where lval
+          changes happen in the network
 
     Args:
-        repr: ProductRepr specifying representations.
+        repr: ProductRepr specifying input (rep1) and output (rep2) representations.
         edge_dim: Dimension of invariant edge features.
         edge_hidden_dim: Hidden dimension for radial networks.
         nheads: Number of attention heads.
-        dropout: Dropout for convolution.
+        dropout: Dropout for convolutions.
         attn_dropout: Dropout for attention weights.
     """
 
@@ -623,36 +629,52 @@ class EquivariantAttention(nn.Module):
         self.repr = repr
         self.nheads = nheads
 
+        # Input/output dimensions
+        in_mult = repr.rep1.mult
+        in_dim = repr.rep1.dim()
         out_mult = repr.rep2.mult
         out_dim = repr.rep2.dim()
+
+        self.in_mult = in_mult
+        self.in_dim = in_dim
         self.out_mult = out_mult
         self.out_dim = out_dim
-        self.hidden_size = out_mult * out_dim
 
-        if self.hidden_size % nheads != 0:
+        # Attention operates in input space (Q and K must match)
+        self.attn_hidden_size = in_mult * in_dim
+
+        if self.attn_hidden_size % nheads != 0:
             raise ValueError(
-                f"hidden_size ({self.hidden_size}) must be divisible by nheads ({nheads})"
+                f"attention hidden_size ({self.attn_hidden_size}) must be "
+                f"divisible by nheads ({nheads})"
             )
 
-        self.head_dim = self.hidden_size // nheads
+        self.head_dim = self.attn_hidden_size // nheads
         self.scale = self.head_dim ** -0.5
 
-        # Q, K, V via equivariant convolution (all edge-level)
-        # Must deepcopy rep1 and rep2 separately to avoid shared object mutation
-        rep1_copy = deepcopy(repr.rep1)
-        rep2_copy = deepcopy(repr.rep2)
-        rep2_copy.mult = 3 * out_mult  # Q, K, V concatenated
-        repr_qkv = ProductRepr(rep1_copy, rep2_copy)
-        self.conv_qkv = EquivariantConvolution(repr_qkv, edge_dim, edge_hidden_dim, dropout)
+        # Q: Node-level projection (EquivariantLinear, keeps rep1 lvals)
+        # Creates a query representation of "what is this node looking for?"
+        self.proj_q = EquivariantLinear(repr.rep1, repr.rep1, dropout=dropout, activation=None)
 
-        # Output projection
+        # K: Edge-level convolution (keeps rep1 lvals for Q·K compatibility)
+        # Keys must have same dimension as queries for dot product
+        repr_k = ProductRepr(deepcopy(repr.rep1), deepcopy(repr.rep1))
+        self.conv_k = EquivariantConvolution(repr_k, edge_dim, edge_hidden_dim, dropout)
+
+        # V: Edge-level convolution (can change to rep2 lvals)
+        # This is where the representation change happens
+        repr_v = ProductRepr(deepcopy(repr.rep1), deepcopy(repr.rep2))
+        self.conv_v = EquivariantConvolution(repr_v, edge_dim, edge_hidden_dim, dropout)
+
+        # Output projection (operates on rep2)
         self.out_proj = EquivariantLinear(repr.rep2, repr.rep2, activation=None)
 
         self.attn_dropout = nn.Dropout(attn_dropout)
 
     def forward(
         self: EquivariantAttention,
-        basis: tuple[torch.Tensor, torch.Tensor],
+        basis_k: tuple[torch.Tensor, torch.Tensor],
+        basis_v: tuple[torch.Tensor, torch.Tensor],
         edge_feats: torch.Tensor,
         f: torch.Tensor,
         neighbor_idx: torch.Tensor,
@@ -661,59 +683,79 @@ class EquivariantAttention(nn.Module):
         """Apply equivariant k-NN attention.
 
         Args:
-            basis: Equivariant basis matrices of shape (N, k, ...).
+            basis_k: Equivariant basis for keys (rep1->rep1), shape (N, k, ...).
+            basis_v: Equivariant basis for values (rep1->rep2), shape (N, k, ...).
             edge_feats: Edge features of shape (N, k, edge_dim).
-            f: Node features of shape (N, mult, dim).
+            f: Node features of shape (N, in_mult, in_dim).
             neighbor_idx: Neighbor indices of shape (N, k).
             mask: Optional attention mask of shape (N, k).
 
         Returns:
-            Updated node features of shape (N, mult, dim).
+            Updated node features of shape (N, out_mult, out_dim).
         """
         N, k = neighbor_idx.shape
 
-        # Flatten for convolution
+        # === Compute Queries (node-level) ===
+        # Q represents "what is node i looking for?" - independent of neighbors
+        queries = self.proj_q(f)  # (N, in_mult, in_dim)
+
+        # === Prepare for edge-level convolutions ===
         src_idx = neighbor_idx.flatten()  # (N*k,)
-        b1, b2 = basis
-        b1_flat = b1.view(N * k, *b1.shape[2:])
-        b2_flat = b2.view(N * k, *b2.shape[2:])
         edge_feats_flat = edge_feats.view(N * k, -1)
 
-        # Compute Q, K, V as edge features via equivariant convolution
-        qkv = self.conv_qkv((b1_flat, b2_flat), edge_feats_flat, f, src_idx)
-        # qkv shape: (N*k, 3*out_mult, out_dim)
-        qkv = qkv.view(N, k, 3 * self.out_mult, self.out_dim)
+        # Flatten basis for keys (rep1->rep1)
+        b1_k, b2_k = basis_k
+        b1_k_flat = b1_k.view(N * k, *b1_k.shape[2:])
+        b2_k_flat = b2_k.view(N * k, *b2_k.shape[2:])
 
-        # Split into Q, K, V: each (N, k, out_mult, out_dim)
-        queries, keys, values = qkv.chunk(3, dim=2)
+        # Flatten basis for values (rep1->rep2)
+        b1_v, b2_v = basis_v
+        b1_v_flat = b1_v.view(N * k, *b1_v.shape[2:])
+        b2_v_flat = b2_v.view(N * k, *b2_v.shape[2:])
 
-        # Reshape for multi-head attention: (N, k, nheads, head_dim)
-        q_heads = queries.flatten(-2, -1).view(N, k, self.nheads, self.head_dim)
+        # === Compute Keys (edge-level, same lvals as Q) ===
+        # K_ij represents "what does neighbor j offer to node i?"
+        keys = self.conv_k((b1_k_flat, b2_k_flat), edge_feats_flat, f, src_idx)
+        keys = keys.view(N, k, self.in_mult, self.in_dim)  # (N, k, in_mult, in_dim)
+
+        # === Compute Values (edge-level, can change lvals) ===
+        # V_ij is the actual information to aggregate, can have different lvals
+        values = self.conv_v((b1_v_flat, b2_v_flat), edge_feats_flat, f, src_idx)
+        values = values.view(N, k, self.out_mult, self.out_dim)  # (N, k, out_mult, out_dim)
+
+        # === Multi-head attention ===
+        # Reshape Q: (N, in_mult, in_dim) -> (N, nheads, head_dim)
+        q_heads = queries.flatten(-2, -1).view(N, self.nheads, self.head_dim)
+
+        # Reshape K: (N, k, in_mult, in_dim) -> (N, k, nheads, head_dim) -> (N, nheads, k, head_dim)
         k_heads = keys.flatten(-2, -1).view(N, k, self.nheads, self.head_dim)
-        v_heads = values.flatten(-2, -1).view(N, k, self.nheads, self.head_dim)
+        k_heads = k_heads.transpose(1, 2)  # (N, nheads, k, head_dim)
 
-        # Transpose to (N, nheads, k, head_dim)
-        q_heads = q_heads.transpose(1, 2)
-        k_heads = k_heads.transpose(1, 2)
-        v_heads = v_heads.transpose(1, 2)
+        # Reshape V: (N, k, out_mult, out_dim) -> (N, k, nheads, v_head_dim) -> (N, nheads, k, v_head_dim)
+        v_hidden_size = self.out_mult * self.out_dim
+        v_head_dim = v_hidden_size // self.nheads
+        v_heads = values.flatten(-2, -1).view(N, k, self.nheads, v_head_dim)
+        v_heads = v_heads.transpose(1, 2)  # (N, nheads, k, v_head_dim)
 
-        # Edge attention scores: element-wise Q · K, sum over head_dim
-        # (N, nheads, k, head_dim) * (N, nheads, k, head_dim) -> sum -> (N, nheads, k)
-        scores = (q_heads * k_heads).sum(dim=-1) * self.scale
+        # === Attention scores: Q_i · K_ij ===
+        # q_heads: (N, nheads, head_dim) -> (N, nheads, 1, head_dim)
+        # k_heads: (N, nheads, k, head_dim)
+        # scores: (N, nheads, 1, k) -> (N, nheads, k)
+        scores = (q_heads.unsqueeze(2) @ k_heads.transpose(-2, -1)).squeeze(2) * self.scale
 
         # Apply mask
         if mask is not None:
             scores = scores.masked_fill(mask.unsqueeze(1), float('-inf'))
 
-        # Softmax over neighbors for each node
+        # Softmax over neighbors
         attn_weights = F.softmax(scores, dim=-1)  # (N, nheads, k)
         attn_weights = self.attn_dropout(attn_weights)
 
-        # Weight edge values by attention and aggregate over edges
-        # attn_weights: (N, nheads, k, 1)
-        # v_heads: (N, nheads, k, head_dim)
-        weighted = attn_weights.unsqueeze(-1) * v_heads  # (N, nheads, k, head_dim)
-        output = weighted.sum(dim=2)  # (N, nheads, head_dim)
+        # === Weighted sum of values ===
+        # attn_weights: (N, nheads, 1, k)
+        # v_heads: (N, nheads, k, v_head_dim)
+        # output: (N, nheads, 1, v_head_dim) -> (N, nheads, v_head_dim)
+        output = (attn_weights.unsqueeze(2) @ v_heads).squeeze(2)
 
         # Reshape back to (N, out_mult, out_dim)
         output = output.view(N, self.out_mult, self.out_dim)
@@ -778,7 +820,8 @@ class EquivariantTransformerBlock(nn.Module):
 
     def forward(
         self: EquivariantTransformerBlock,
-        basis: tuple[torch.Tensor, torch.Tensor],
+        basis_k: tuple[torch.Tensor, torch.Tensor],
+        basis_v: tuple[torch.Tensor, torch.Tensor],
         features: torch.Tensor,
         edge_feats: torch.Tensor,
         neighbor_idx: torch.Tensor,
@@ -787,7 +830,8 @@ class EquivariantTransformerBlock(nn.Module):
         """Apply transformer block.
 
         Args:
-            basis: Equivariant basis matrices of shape (N, k, ...).
+            basis_k: Equivariant basis for keys (rep1->rep1), shape (N, k, ...).
+            basis_v: Equivariant basis for values (rep1->rep2), shape (N, k, ...).
             features: Node features of shape (N, mult, dim).
             edge_feats: Edge features of shape (N, k, edge_dim).
             neighbor_idx: Neighbor indices of shape (N, k).
@@ -801,7 +845,7 @@ class EquivariantTransformerBlock(nn.Module):
             features_tmp = features
 
         features = self.ln1(features)
-        features = self.attn(basis, edge_feats, features, neighbor_idx, mask)
+        features = self.attn(basis_k, basis_v, edge_feats, features, neighbor_idx, mask)
 
         if self.skip:
             features = features_tmp + self.residual_scale * features
@@ -892,19 +936,32 @@ class EquivariantTransformer(nn.Module):
         # Build sequence of representations
         reprs = [in_repr] + [hidden_repr] * hidden_layers + [out_repr_tmp]
 
-        # Create layers and track product representations
+        # Create layers and track product representations for K and V
+        # K uses rep1->rep1 (same lvals as Q for dot product compatibility)
+        # V uses rep1->rep2 (actual transition, where lval changes happen)
         layers = []
-        preprs = []
+        preprs_k = []  # ProductReprs for keys
+        preprs_v = []  # ProductReprs for values
         for i in range(len(reprs) - 1):
             repr1, repr2 = reprs[i], reprs[i + 1]
-            prepr = ProductRepr(deepcopy(repr1), deepcopy(repr2))
-            preprs.append(prepr)
-            layers.append(self._construct_layer(prepr))
+            # For values: rep1 -> rep2 (the actual layer transition)
+            prepr_v = ProductRepr(deepcopy(repr1), deepcopy(repr2))
+            preprs_v.append(prepr_v)
+            # For keys: rep1 -> rep1 (same lvals as queries)
+            prepr_k = ProductRepr(deepcopy(repr1), deepcopy(repr1))
+            preprs_k.append(prepr_k)
+            # Layer uses V's ProductRepr for its configuration
+            layers.append(self._construct_layer(prepr_v))
 
         self.layers = nn.ModuleList(layers)
+        self.num_layers = len(layers)
 
-        # Compute equivariant bases for all product representations
-        self.bases = EquivariantBases(*preprs)
+        # Compute equivariant bases for both K and V ProductReprs
+        # Interleave: [k0, v0, k1, v1, ...] for efficient deduplication
+        all_preprs = []
+        for pk, pv in zip(preprs_k, preprs_v):
+            all_preprs.extend([pk, pv])
+        self.bases = EquivariantBases(*all_preprs)
 
         # Radial basis functions for edge features
         self.rbf = RadialBasisFunctions(edge_dim)
@@ -968,14 +1025,29 @@ class EquivariantTransformer(nn.Module):
             distances = displacements.norm(dim=-1)  # (N, k)
             edge_features = self.rbf(distances)  # (N, k, edge_dim)
 
-        # Compute all bases at once
+        # Compute all bases at once (interleaved: k0, v0, k1, v1, ...)
         all_bases_flat = self.bases(displacements.view(N * k, 3))
 
         # Reshape bases for (N, k, ...) structure and pass through layers
-        for layer, (b1, b2) in zip(self.layers, all_bases_flat):
-            b1 = b1.view(N, k, *b1.shape[1:])
-            b2 = b2.view(N, k, *b2.shape[1:])
-            node_features = layer((b1, b2), node_features, edge_features, neighbor_idx, mask)
+        # Bases are interleaved: [basis_k_0, basis_v_0, basis_k_1, basis_v_1, ...]
+        for i, layer in enumerate(self.layers):
+            # Extract K and V bases for this layer
+            basis_k = all_bases_flat[2 * i]      # (b1_k, b2_k)
+            basis_v = all_bases_flat[2 * i + 1]  # (b1_v, b2_v)
+
+            # Reshape to (N, k, ...)
+            b1_k, b2_k = basis_k
+            b1_k = b1_k.view(N, k, *b1_k.shape[1:])
+            b2_k = b2_k.view(N, k, *b2_k.shape[1:])
+
+            b1_v, b2_v = basis_v
+            b1_v = b1_v.view(N, k, *b1_v.shape[1:])
+            b2_v = b2_v.view(N, k, *b2_v.shape[1:])
+
+            node_features = layer(
+                (b1_k, b2_k), (b1_v, b2_v),
+                node_features, edge_features, neighbor_idx, mask
+            )
 
         # Final layer norm and output projection
         node_features = self.final_ln(node_features)

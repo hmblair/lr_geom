@@ -1255,25 +1255,28 @@ class TestArchitectureDiagnostics:
         coords = torch.randn(N, 3)
         neighbor_idx = lg.build_knn_graph(coords, k)
 
-        # Create basis
+        # Create bases for K (rep1->rep1) and V (rep1->rep2)
         neighbor_coords = coords[neighbor_idx]
         displacements = coords.unsqueeze(1) - neighbor_coords
-        basis_layer = lg.EquivariantBasis(product_repr)
-        b1, b2 = basis_layer(displacements.view(N * k, 3))
-        b1 = b1.view(N, k, *b1.shape[1:])
-        b2 = b2.view(N, k, *b2.shape[1:])
+
+        # Basis for keys: rep1 -> rep1
+        repr_k = lg.ProductRepr(repr, repr)
+        basis_k_layer = lg.EquivariantBasis(repr_k)
+        b1_k, b2_k = basis_k_layer(displacements.view(N * k, 3))
+        b1_k = b1_k.view(N, k, *b1_k.shape[1:])
+        b2_k = b2_k.view(N, k, *b2_k.shape[1:])
+
+        # Basis for values: rep1 -> rep2 (same as product_repr in this case)
+        basis_v_layer = lg.EquivariantBasis(product_repr)
+        b1_v, b2_v = basis_v_layer(displacements.view(N * k, 3))
+        b1_v = b1_v.view(N, k, *b1_v.shape[1:])
+        b2_v = b2_v.view(N, k, *b2_v.shape[1:])
 
         edge_feats = torch.randn(N, k, 16)
         features = torch.randn(N, repr.mult, repr.dim())
 
-        # Hook to capture attention weights
-        attn_weights_captured = []
-        def hook(module, input, output):
-            # The softmax is applied to scores, we need to intercept
-            pass
-
         with torch.no_grad():
-            output = attn((b1, b2), edge_feats, features, neighbor_idx)
+            output = attn((b1_k, b2_k), (b1_v, b2_v), edge_feats, features, neighbor_idx)
 
         # Output should have reasonable variance (not collapsed)
         output_var = output.var()
@@ -1407,10 +1410,12 @@ class TestArchitectureDiagnostics:
             assert not torch.isinf(output).any(), "Deep network produced Inf"
 
     def test_attention_qkv_independence(self):
-        """Test whether Q, K, V have independent representations.
+        """Test that Q, K, V have independent projections.
 
-        Note: Current implementation uses shared conv_qkv which may limit
-        expressiveness compared to independent Q, K, V projections.
+        The standard attention pattern uses:
+        - Q: EquivariantLinear (node-level, keeps input lvals)
+        - K: EquivariantConvolution (edge-level, keeps input lvals for Q·K)
+        - V: EquivariantConvolution (edge-level, can change to output lvals)
         """
         repr = lg.Repr(lvals=[0, 1], mult=8)
         product_repr = lg.ProductRepr(repr, repr)
@@ -1419,15 +1424,20 @@ class TestArchitectureDiagnostics:
             product_repr, edge_dim=16, edge_hidden_dim=32, nheads=4
         )
 
-        # Check that conv_qkv has 3x the output multiplicity
-        expected_qkv_mult = 3 * repr.mult
-        actual_qkv_mult = attn.conv_qkv.rwlin.out_dim
+        # Verify Q has its own projection (EquivariantLinear)
+        assert hasattr(attn, 'proj_q'), "Attention should have proj_q for queries"
+        assert isinstance(attn.proj_q, lg.EquivariantLinear), "Q should use EquivariantLinear"
 
-        # This documents the current behavior (shared weights for Q, K, V)
-        # A separate test would be needed if we switch to independent projections
-        assert actual_qkv_mult == expected_qkv_mult, (
-            f"Expected QKV mult {expected_qkv_mult}, got {actual_qkv_mult}"
-        )
+        # Verify K has its own convolution
+        assert hasattr(attn, 'conv_k'), "Attention should have conv_k for keys"
+        assert isinstance(attn.conv_k, lg.EquivariantConvolution), "K should use EquivariantConvolution"
+
+        # Verify V has its own convolution
+        assert hasattr(attn, 'conv_v'), "Attention should have conv_v for values"
+        assert isinstance(attn.conv_v, lg.EquivariantConvolution), "V should use EquivariantConvolution"
+
+        # Verify K and V are separate modules (not sharing weights)
+        assert attn.conv_k is not attn.conv_v, "K and V should have separate convolutions"
 
     def test_first_layer_gradient_magnitude(self, diagnostic_setup):
         """Test gradient magnitude at first layer (no skip connection case)."""
