@@ -272,6 +272,43 @@ class TestEquivariantLayerNorm:
 
         assert sample_input.grad is not None
 
+    def test_mult_one_non_zero_output(self):
+        """Test LayerNorm with mult=1 produces non-zero output.
+
+        This is a regression test for a critical bug where LayerNorm(1)
+        always outputs zeros (since normalizing a single value gives 0).
+        The fix uses simple norm-based scaling for mult=1.
+        """
+        repr_mult1 = lg.Repr(lvals=[0, 1], mult=1)
+        layer = lg.EquivariantLayerNorm(repr_mult1)
+
+        x = torch.randn(10, 1, 4)  # (batch, mult=1, dim=4)
+        output = layer(x)
+
+        # Output should NOT be all zeros
+        assert output.abs().max() > 1e-6, "LayerNorm with mult=1 should produce non-zero output"
+
+        # Output should have unit norm per irrep (since we divide by norm)
+        # Check that output is properly normalized (has reasonable magnitude)
+        assert output.abs().max() < 10, "Output should have bounded magnitude"
+
+    def test_mult_one_equivariance(self, rotation_params):
+        """Test equivariance is preserved for mult=1 LayerNorm."""
+        axis, angle = rotation_params
+        repr_mult1 = lg.Repr(lvals=[0, 1], mult=1)
+        layer = lg.EquivariantLayerNorm(repr_mult1)
+        layer.eval()
+
+        D = get_wigner_d_matrix(repr_mult1, axis, angle)
+        x = torch.randn(10, 1, 4)
+
+        x_rotated = x @ D.T
+        y_from_rotated = layer(x_rotated)
+        y_rotated = layer(x) @ D.T
+
+        assert torch.allclose(y_from_rotated, y_rotated, rtol=RTOL, atol=ATOL), \
+            f"LayerNorm mult=1 should be equivariant. Max diff: {(y_from_rotated - y_rotated).abs().max()}"
+
 
 # ============================================================================
 # EQUIVARIANTCONVOLUTION TESTS

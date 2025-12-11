@@ -461,8 +461,10 @@ class EquivariantLayerNorm(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.mult = repr.mult
         self.norm = RepNorm(repr)
-        self.lnorm = nn.LayerNorm(repr.mult)
+        # LayerNorm(1) is degenerate (always outputs zeros), so skip it for mult=1
+        self.lnorm = nn.LayerNorm(repr.mult) if repr.mult > 1 else None
         self.epsilon = epsilon
 
         self.register_buffer('ix', torch.tensor(repr.indices(), dtype=torch.long))
@@ -478,6 +480,12 @@ class EquivariantLayerNorm(nn.Module):
         """
         # Compute norms
         norms = self.norm(f)
+
+        # For mult=1, just normalize by the norm (no cross-channel normalization)
+        if self.lnorm is None:
+            norms_r = 1.0 / (norms + self.epsilon)
+            return f * norms_r[..., self.ix]
+
         *b, h, d = norms.size()
 
         # Apply LayerNorm across multiplicity
