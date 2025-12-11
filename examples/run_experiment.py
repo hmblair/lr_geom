@@ -190,9 +190,8 @@ def train_epoch(
     vae.train()
 
     total_loss = 0.0
-    total_mse = 0.0
-    total_kl = 0.0
     total_rmsd = 0.0
+    total_kl = 0.0
     n_batches = 0
 
     # Shuffle structures
@@ -210,11 +209,14 @@ def train_epoch(
         features = embedding(atoms).unsqueeze(-1)
         recon, mu, logvar = vae(coords, features)
 
-        # Compute losses (on normalized coordinates for training stability)
+        # Compute aligned RMSD loss using ciffy (differentiable)
         coords_pred = recon[:, 0, :]
-        mse_loss = ((coords_pred - coords) ** 2).mean()
+        coords_pred_unnorm = coords_pred * coord_scale
+        pred_polymer = polymer.with_coordinates(coords_pred_unnorm)
+        rmsd_loss = ciffy.rmsd(polymer, pred_polymer)
+
         kl_loss = kl_divergence(mu, logvar).mean()
-        loss = mse_loss + config.kl_weight * kl_loss
+        loss = rmsd_loss + config.kl_weight * kl_loss
 
         # Backward pass
         optimizer.zero_grad()
@@ -228,23 +230,15 @@ def train_epoch(
 
         optimizer.step()
 
-        # Compute aligned RMSD in Angstroms using ciffy
-        with torch.no_grad():
-            coords_pred_unnorm = coords_pred.detach().cpu() * coord_scale
-            pred_polymer = polymer.with_coordinates(coords_pred_unnorm)
-            rmsd = ciffy.rmsd(polymer, pred_polymer)
-            total_rmsd += rmsd
-
         total_loss += loss.item()
-        total_mse += mse_loss.item()
+        total_rmsd += rmsd_loss.item()
         total_kl += kl_loss.item()
         n_batches += 1
 
     return {
         "loss": total_loss / n_batches,
-        "mse": total_mse / n_batches,
-        "kl": total_kl / n_batches,
         "rmsd": total_rmsd / n_batches,
+        "kl": total_kl / n_batches,
     }
 
 
@@ -271,9 +265,8 @@ def evaluate(
     vae.eval()
 
     total_loss = 0.0
-    total_mse = 0.0
-    total_kl = 0.0
     total_rmsd = 0.0
+    total_kl = 0.0
 
     with torch.no_grad():
         for s in structures:
@@ -285,27 +278,24 @@ def evaluate(
             features = embedding(atoms).unsqueeze(-1)
             recon, mu, logvar = vae(coords, features)
 
+            # Compute aligned RMSD using ciffy
             coords_pred = recon[:, 0, :]
-            mse_loss = ((coords_pred - coords) ** 2).mean()
-            kl_loss = kl_divergence(mu, logvar).mean()
-            loss = mse_loss + config.kl_weight * kl_loss
-
-            # Compute aligned RMSD in Angstroms using ciffy
-            coords_pred_unnorm = coords_pred.cpu() * coord_scale
+            coords_pred_unnorm = coords_pred * coord_scale
             pred_polymer = polymer.with_coordinates(coords_pred_unnorm)
             rmsd = ciffy.rmsd(polymer, pred_polymer)
 
+            kl_loss = kl_divergence(mu, logvar).mean()
+            loss = rmsd + config.kl_weight * kl_loss
+
             total_loss += loss.item()
-            total_mse += mse_loss.item()
+            total_rmsd += rmsd.item()
             total_kl += kl_loss.item()
-            total_rmsd += rmsd
 
     n = len(structures)
     return {
         "loss": total_loss / n,
-        "mse": total_mse / n,
-        "kl": total_kl / n,
         "rmsd": total_rmsd / n,
+        "kl": total_kl / n,
     }
 
 
