@@ -185,6 +185,7 @@ def train_epoch(
         Dictionary of training metrics.
     """
     import ciffy
+    import time
 
     embedding.train()
     vae.train()
@@ -193,6 +194,8 @@ def train_epoch(
     total_rmsd = 0.0
     total_kl = 0.0
     n_batches = 0
+
+    epoch_start = time.time()
 
     # Shuffle structures
     indices = list(range(len(structures)))
@@ -235,10 +238,13 @@ def train_epoch(
         total_kl += kl_loss.item()
         n_batches += 1
 
+    epoch_time = time.time() - epoch_start
+
     return {
         "loss": total_loss / n_batches,
         "rmsd": total_rmsd / n_batches,
         "kl": total_kl / n_batches,
+        "time": epoch_time,
     }
 
 
@@ -450,7 +456,7 @@ def run_experiment(config: ExperimentConfig) -> dict:
         )
         if val_structures:
             log_str += f"Val RMSD: {val_metrics['rmsd']:.2f}Å | "
-        log_str += f"LR: {lr:.2e}"
+        log_str += f"Time: {train_metrics['time']:.1f}s | LR: {lr:.2e}"
         print(log_str)
 
         # Early stopping check
@@ -462,6 +468,10 @@ def run_experiment(config: ExperimentConfig) -> dict:
     print()
     print("Final evaluation...")
 
+    # Compute average epoch time
+    epoch_times = [m["time"] for m in history["train"]]
+    avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
+
     # Load best model
     checkpoint = torch.load(output_dir / "best_model.pt")
     embedding.load_state_dict(checkpoint["embedding"])
@@ -471,6 +481,7 @@ def run_experiment(config: ExperimentConfig) -> dict:
         "best_epoch": checkpoint["epoch"],
         "best_val_loss": checkpoint["val_loss"],
         "best_val_rmsd": checkpoint.get("val_rmsd"),
+        "avg_epoch_time": avg_epoch_time,
     }
 
     if test_structures:
@@ -478,6 +489,7 @@ def run_experiment(config: ExperimentConfig) -> dict:
         results["test"] = test_metrics
         print(f"Test RMSD: {test_metrics['rmsd']:.2f}Å")
         print(f"Test Loss: {test_metrics['loss']:.4f}")
+        print(f"Avg epoch time: {avg_epoch_time:.1f}s")
 
     # Save results
     results["history"] = history

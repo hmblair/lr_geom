@@ -246,6 +246,7 @@ def compare_results(
                 "test_rmsd": data.get("test", {}).get("rmsd"),
                 "test_loss": data.get("test", {}).get("loss"),
                 "best_epoch": data.get("best_epoch"),
+                "avg_epoch_time": data.get("avg_epoch_time"),
             })
         except Exception as e:
             print(f"Warning: Could not load results for {exp['name']}: {e}")
@@ -259,25 +260,26 @@ def compare_results(
 
     # Print comparison table
     print()
-    print("=" * 78)
+    print("=" * 90)
     print("EXPERIMENT COMPARISON (RMSD in Angstroms, aligned via Kabsch)")
-    print("=" * 78)
+    print("=" * 90)
     print(
         f"{'Name':<20} {'k':<6} {'Rank':<8} "
-        f"{'Val RMSD':<12} {'Test RMSD':<12} {'Epoch':<8}"
+        f"{'Val RMSD':<12} {'Test RMSD':<12} {'Epoch':<8} {'Time/Ep':<10}"
     )
-    print("-" * 78)
+    print("-" * 90)
 
     for r in results:
         val_rmsd = f"{r['best_val_rmsd']:.2f}Å" if r.get("best_val_rmsd") else "N/A"
         test_rmsd = f"{r['test_rmsd']:.2f}Å" if r.get("test_rmsd") else "N/A"
         epoch = str(r.get("best_epoch", "N/A"))
+        epoch_time = f"{r['avg_epoch_time']:.1f}s" if r.get("avg_epoch_time") else "N/A"
         print(
             f"{r['name']:<20} {r['k']:<6} {str(r['rank']):<8} "
-            f"{val_rmsd:<12} {test_rmsd:<12} {epoch:<8}"
+            f"{val_rmsd:<12} {test_rmsd:<12} {epoch:<8} {epoch_time:<10}"
         )
 
-    print("=" * 78)
+    print("=" * 90)
 
     # Save summary to file
     summary_file = output_path / "comparison_summary.txt"
@@ -295,6 +297,7 @@ def compare_results(
             f.write(f"  best_val_loss: {r.get('best_val_loss')}\n")
             f.write(f"  test_loss: {r.get('test_loss')}\n")
             f.write(f"  best_epoch: {r.get('best_epoch')}\n")
+            f.write(f"  avg_epoch_time: {r.get('avg_epoch_time')}\n")
             f.write("\n")
 
     print(f"\nSummary saved to: {summary_file}")
