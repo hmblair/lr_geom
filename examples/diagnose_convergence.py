@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path.home() / "academic/software/ciffy"))
+sys.path.insert(0, str(Path.home() / "software/ciffy"))
 
 import lr_geom as lg
 from lr_geom.vae import EquivariantVAE, kl_divergence
@@ -41,7 +41,6 @@ def diagnose():
             polymer = ciffy.load(str(cif_file), backend="torch")
             n_atoms = polymer.size()
             if n_atoms > 700 or n_atoms < 20:
-                print(f"  Skipping {cif_file.name}: {n_atoms} atoms (out of range)")
                 continue
             polymer, _ = polymer.center()
             coords = polymer.coordinates.float()
@@ -54,6 +53,7 @@ def diagnose():
                 "id": polymer.id(),
                 "polymer": polymer.to(device),
             })
+            print(f"  Loaded {cif_file.name}: {n_atoms} atoms")
             if len(structures) >= 1:
                 break
         except Exception as e:
@@ -65,7 +65,7 @@ def diagnose():
         return
 
     s = structures[0]
-    print(f"Loaded: {s['id']} with {s['coords'].shape[0]} atoms")
+    print(f"\nUsing: {s['id']} with {s['coords'].shape[0]} atoms")
     print(f"Coord scale: {s['coord_scale']:.2f}Å")
     print(f"Normalized coords range: [{s['coords'].min():.3f}, {s['coords'].max():.3f}]")
     print()
@@ -108,144 +108,87 @@ def diagnose():
     print(f"Total parameters: {num_params:,}")
     print()
 
-    # Detailed layer-by-layer trace
-    print("=" * 60)
-    print("LAYER-BY-LAYER TRACE (forward pass)")
-    print("=" * 60)
-
-    coords = s["coords"]
-    atoms = s["atoms"]
-
+    # Helper to print stats
     def print_stats(name, tensor):
         if tensor.numel() == 0:
             print(f"  {name}: EMPTY")
             return
         print(f"  {name}: shape={list(tensor.shape)}, "
               f"range=[{tensor.min():.4f}, {tensor.max():.4f}], "
-              f"std={tensor.std():.4f}, mean={tensor.abs().mean():.4f}")
+              f"std={tensor.std():.4f}")
+
+    # Register hooks to capture intermediate outputs
+    print("=" * 60)
+    print("LAYER-BY-LAYER TRACE (forward pass)")
+    print("=" * 60)
+
+    activations = {}
+
+    def make_hook(name):
+        def hook(module, input, output):
+            if isinstance(output, tuple):
+                activations[name] = output[0].detach()
+            else:
+                activations[name] = output.detach()
+        return hook
+
+    # Register hooks on key layers
+    hooks = []
+
+    # Encoder layers
+    for i, layer in enumerate(vae.encoder.layers):
+        hooks.append(layer.ln1.register_forward_hook(make_hook(f"enc.layer{i}.ln1")))
+        hooks.append(layer.attn.register_forward_hook(make_hook(f"enc.layer{i}.attn")))
+        if layer.transition is not None:
+            hooks.append(layer.transition.register_forward_hook(make_hook(f"enc.layer{i}.transition")))
+
+    hooks.append(vae.encoder.final_ln.register_forward_hook(make_hook("enc.final_ln")))
+    hooks.append(vae.encoder.proj.register_forward_hook(make_hook("enc.proj")))
+
+    # Variational head
+    hooks.append(vae.var_head.mu_proj.register_forward_hook(make_hook("var_head.mu")))
+    hooks.append(vae.var_head.logvar_net.register_forward_hook(make_hook("var_head.logvar")))
+
+    # Decoder layers
+    for i, layer in enumerate(vae.decoder.layers):
+        hooks.append(layer.ln1.register_forward_hook(make_hook(f"dec.layer{i}.ln1")))
+        hooks.append(layer.attn.register_forward_hook(make_hook(f"dec.layer{i}.attn")))
+        if layer.transition is not None:
+            hooks.append(layer.transition.register_forward_hook(make_hook(f"dec.layer{i}.transition")))
+
+    hooks.append(vae.decoder.final_ln.register_forward_hook(make_hook("dec.final_ln")))
+    hooks.append(vae.decoder.proj.register_forward_hook(make_hook("dec.proj")))
+
+    # Run forward pass
+    coords = s["coords"]
+    atoms = s["atoms"]
 
     with torch.no_grad():
-        # 1. Input embedding
-        print("\n1. INPUT EMBEDDING")
-        features = embedding(atoms).unsqueeze(-1)  # (N, embed_dim, 1)
-        print_stats("atoms (input)", atoms.float())
+        print("\n1. INPUT")
+        features = embedding(atoms).unsqueeze(-1)
         print_stats("features (embedded)", features)
 
-        # 2. Encoder - trace through layers
-        print("\n2. ENCODER LAYERS")
-        enc = vae.encoder
-        neighbor_idx = lg.build_knn_graph(coords, enc.k_neighbors)
-        displacements = coords[neighbor_idx] - coords.unsqueeze(1)
-        edge_feats = enc.rbf(displacements.norm(dim=-1))
-        all_bases = enc.bases(displacements)
+        print("\n2. VAE FORWARD")
+        recon, mu, logvar = vae(coords, features)
 
-        print_stats("edge_features (RBF)", edge_feats)
+        # Print all captured activations
+        print("\n3. CAPTURED ACTIVATIONS")
+        for name, act in activations.items():
+            print_stats(name, act)
 
-        x = features
-        for i, block in enumerate(enc.layers):
-            basis_k = all_bases[2 * i]
-            basis_v = all_bases[2 * i + 1]
-
-            print(f"\n  --- Encoder Layer {i} ---")
-            print_stats(f"  input", x)
-
-            # LayerNorm
-            x_ln = block.ln1(x)
-            print_stats(f"  after ln1", x_ln)
-
-            # Attention
-            attn_out = block.attn(x_ln, neighbor_idx, edge_feats, basis_k, basis_v)
-            print_stats(f"  attn output", attn_out)
-
-            # Residual
-            if block.skip:
-                x = attn_out + block.residual_scale * x
-                print_stats(f"  after residual (skip={block.skip})", x)
-            else:
-                x = attn_out
-                print_stats(f"  after residual (skip={block.skip}, no add)", x)
-
-            # Transition
-            if block.transition is not None:
-                x_ln2 = block.ln2(x)
-                trans_out = block.transition(x_ln2)
-                x = trans_out + block.residual_scale * x
-                print_stats(f"  after transition", x)
-
-        encoder_output = enc.final_ln(x)
-        print_stats("\nencoder final_ln output", encoder_output)
-
-        # Output projection
-        encoder_final = enc.proj(encoder_output)
-        print_stats("encoder proj output", encoder_final)
-
-        # 3. Variational head
-        print("\n3. VARIATIONAL HEAD")
-        mu = vae.var_head.mu_proj(encoder_final)
-        print_stats("mu", mu)
-
-        norms = lg.RepNorm(vae.var_head.in_repr)(encoder_final)
-        print_stats("norms for logvar", norms)
-        logvar = vae.var_head.logvar_net(norms)
-        print_stats("logvar", logvar)
-
-        # 4. Reparameterization
-        print("\n4. REPARAMETERIZATION")
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(mu)
-        z = mu + std.unsqueeze(-1) * eps
-        print_stats("z (latent)", z)
-
-        # 5. Decoder
-        print("\n5. DECODER LAYERS")
-        dec = vae.decoder
-        dec_neighbor_idx = lg.build_knn_graph(coords, dec.k_neighbors)
-        dec_displacements = coords[dec_neighbor_idx] - coords.unsqueeze(1)
-        dec_edge_feats = dec.rbf(dec_displacements.norm(dim=-1))
-        dec_all_bases = dec.bases(dec_displacements)
-
-        y = z
-        for i, block in enumerate(dec.layers):
-            basis_k = dec_all_bases[2 * i]
-            basis_v = dec_all_bases[2 * i + 1]
-
-            print(f"\n  --- Decoder Layer {i} ---")
-            print_stats(f"  input", y)
-
-            y_ln = block.ln1(y)
-            print_stats(f"  after ln1", y_ln)
-
-            attn_out = block.attn(y_ln, dec_neighbor_idx, dec_edge_feats, basis_k, basis_v)
-            print_stats(f"  attn output", attn_out)
-
-            if block.skip:
-                y = attn_out + block.residual_scale * y
-                print_stats(f"  after residual (skip={block.skip})", y)
-            else:
-                y = attn_out
-                print_stats(f"  after residual (skip={block.skip}, no add)", y)
-
-            if block.transition is not None:
-                y_ln2 = block.ln2(y)
-                trans_out = block.transition(y_ln2)
-                y = trans_out + block.residual_scale * y
-                print_stats(f"  after transition", y)
-
-        decoder_output = dec.final_ln(y)
-        print_stats("\ndecoder final_ln output", decoder_output)
-
-        # 6. Output projection
-        print("\n6. OUTPUT PROJECTION")
-        recon = dec.proj(decoder_output)
-        print_stats("final reconstruction", recon)
-
+        print("\n4. FINAL OUTPUT")
         coords_pred = recon[:, 0, :]
-        print_stats("coords_pred (extracted)", coords_pred)
+        print_stats("reconstruction", recon)
+        print_stats("coords_pred", coords_pred)
         print_stats("coords_target", coords)
 
         print(f"\nMSE: {((coords_pred - coords) ** 2).mean():.6f}")
         print(f"Target std: {coords.std():.4f}, Pred std: {coords_pred.std():.4f}")
         print(f"Ratio (pred/target std): {coords_pred.std() / coords.std():.4f}")
+
+    # Clean up hooks
+    for h in hooks:
+        h.remove()
 
 
 if __name__ == "__main__":
