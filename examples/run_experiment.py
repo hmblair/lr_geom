@@ -146,10 +146,10 @@ def load_structures(
 
             structures.append({
                 "coords": coords_normalized.to(device),
-                "coord_scale": coord_scale.item(),
+                "coord_scale": coord_scale.to(device),
                 "atoms": polymer.atoms.long().to(device).clamp(min=0),
                 "id": polymer.id(),
-                "polymer": polymer,  # Keep for ciffy.rmsd
+                "polymer": polymer.to(device),  # Keep for ciffy.rmsd
             })
 
             if config.num_structures and len(structures) >= config.num_structures:
