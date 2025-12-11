@@ -10,11 +10,10 @@ Key Concepts:
     - **Low-Rank Decomposition**: Efficient tensor product via basis matrices
 
 Modules:
-    alignment: Point cloud alignment (Kabsch algorithm, RMSD)
     representations: SO(3) representation theory (irreps, Wigner D-matrices)
     equivariant: Equivariant primitives (spherical harmonics, basis functions)
     layers: Equivariant neural network layers (convolution, attention)
-    models: Pre-built geometric models
+    models: Pre-built geometric models (GNM functions)
     vae: SO(3)-equivariant variational autoencoder
 
 Optional Dependencies:
@@ -32,17 +31,6 @@ Example:
 """
 
 __version__ = "0.1.0"
-
-# Alignment and scoring
-from .alignment import (
-    rmsd,
-    get_kabsch_rotation_matrix,
-    kabsch_align,
-    RMSD,
-    graph_laplacian,
-    gnm_correlations,
-    gnm_variances,
-)
 
 # Representation theory
 from .representations import (
@@ -63,8 +51,13 @@ from .equivariant import (
     EquivariantBases,
 )
 
-# Models
-from .models import GNMA
+# Models (includes GNM functions)
+from .models import (
+    GNMA,
+    graph_laplacian,
+    gnm_correlations,
+    gnm_variances,
+)
 
 # VAE
 from .vae import (
@@ -95,14 +88,6 @@ __all__ = [
     # Constants
     "FEATURE_DIM",
     "REPR_DIM",
-    # Alignment
-    "rmsd",
-    "get_kabsch_rotation_matrix",
-    "kabsch_align",
-    "RMSD",
-    "graph_laplacian",
-    "gnm_correlations",
-    "gnm_variances",
     # Representations
     "Irrep",
     "ProductIrrep",
@@ -114,8 +99,11 @@ __all__ = [
     "RadialBasisFunctions",
     "EquivariantBasis",
     "EquivariantBases",
-    # Models
+    # Models and GNM
     "GNMA",
+    "graph_laplacian",
+    "gnm_correlations",
+    "gnm_variances",
     # VAE
     "EquivariantVAE",
     "VariationalHead",
