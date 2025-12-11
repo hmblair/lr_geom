@@ -91,6 +91,148 @@ class TestRadialWeight:
 
         assert not torch.allclose(layer.layer1.weight, initial_weights)
 
+    def test_low_rank_forward_shape(self, product_repr, edge_features, edge_dim, hidden_dim):
+        """Test low-rank RadialWeight produces correct output shape."""
+        rank = 4
+        layer = lg.RadialWeight(
+            edge_dim=edge_dim,
+            hidden_dim=hidden_dim,
+            repr=product_repr,
+            in_dim=product_repr.rep1.mult,
+            out_dim=product_repr.rep2.mult,
+            rank=rank,
+        )
+        output = layer(edge_features)
+
+        expected_shape = (
+            edge_features.size(0),
+            product_repr.rep2.nreps() * product_repr.rep2.mult,
+            product_repr.rep1.nreps() * product_repr.rep1.mult,
+        )
+        assert output.shape == expected_shape
+
+    def test_low_rank_no_nan(self, product_repr, edge_features, edge_dim, hidden_dim):
+        """Test low-rank RadialWeight output contains no NaN values."""
+        layer = lg.RadialWeight(
+            edge_dim, hidden_dim, product_repr,
+            product_repr.rep1.mult, product_repr.rep2.mult,
+            rank=4,
+        )
+        output = layer(edge_features)
+        assert not torch.isnan(output).any()
+
+    def test_low_rank_backward(self, product_repr, edge_features, edge_dim, hidden_dim):
+        """Test low-rank RadialWeight gradients flow correctly."""
+        layer = lg.RadialWeight(
+            edge_dim, hidden_dim, product_repr,
+            product_repr.rep1.mult, product_repr.rep2.mult,
+            rank=4,
+        )
+        edge_features = edge_features.clone().requires_grad_(True)
+
+        output = layer(edge_features)
+        loss = output.sum()
+        loss.backward()
+
+        assert edge_features.grad is not None
+        assert not torch.isnan(edge_features.grad).any()
+        for name, param in layer.named_parameters():
+            assert param.grad is not None, f"No gradient for {name}"
+            assert not torch.isnan(param.grad).any(), f"NaN gradient for {name}"
+
+    def test_low_rank_fewer_parameters(self):
+        """Test that low-rank version has fewer parameters than full-rank."""
+        # Use larger representation where savings are significant
+        large_repr = lg.ProductRepr(
+            lg.Repr([0, 1], mult=16),
+            lg.Repr([0, 1], mult=16),
+        )
+        edge_dim = 16
+        hidden_dim = 32
+
+        full_rank = lg.RadialWeight(
+            edge_dim, hidden_dim, large_repr,
+            large_repr.rep1.mult, large_repr.rep2.mult,
+        )
+        low_rank = lg.RadialWeight(
+            edge_dim, hidden_dim, large_repr,
+            large_repr.rep1.mult, large_repr.rep2.mult,
+            rank=4,
+        )
+
+        full_params = sum(p.numel() for p in full_rank.parameters())
+        low_params = sum(p.numel() for p in low_rank.parameters())
+
+        # Low-rank should have fewer parameters
+        # Full: hidden_dim * (nl1*in_dim * nl2*out_dim) = 32 * (2*16 * 2*16) = 32 * 1024 = 32768
+        # Low:  hidden_dim * (nl2*out_dim*k + k*nl1*in_dim) = 32 * (32*4 + 4*32) = 32 * 256 = 8192
+        assert low_params < full_params, f"Low-rank ({low_params}) should have fewer params than full ({full_params})"
+
+    def test_low_rank_has_left_right_layers(self, product_repr, edge_dim, hidden_dim):
+        """Test that low-rank RadialWeight has layer_left and layer_right."""
+        layer = lg.RadialWeight(
+            edge_dim, hidden_dim, product_repr,
+            product_repr.rep1.mult, product_repr.rep2.mult,
+            rank=4,
+        )
+        assert hasattr(layer, 'layer_left')
+        assert hasattr(layer, 'layer_right')
+        assert not hasattr(layer, 'layer2')
+
+    def test_full_rank_has_layer2(self, product_repr, edge_dim, hidden_dim):
+        """Test that full-rank RadialWeight has layer2 not left/right."""
+        layer = lg.RadialWeight(
+            edge_dim, hidden_dim, product_repr,
+            product_repr.rep1.mult, product_repr.rep2.mult,
+        )
+        assert hasattr(layer, 'layer2')
+        assert not hasattr(layer, 'layer_left')
+        assert not hasattr(layer, 'layer_right')
+
+    def test_low_rank_invalid_rank(self, product_repr, edge_dim, hidden_dim):
+        """Test that invalid rank raises error."""
+        with pytest.raises(ValueError, match="rank must be positive"):
+            lg.RadialWeight(
+                edge_dim, hidden_dim, product_repr,
+                product_repr.rep1.mult, product_repr.rep2.mult,
+                rank=0,
+            )
+
+    def test_low_rank_convolution(self):
+        """Test EquivariantConvolution with low-rank radial weights."""
+        repr = lg.ProductRepr(lg.Repr([0, 1], mult=8), lg.Repr([0, 1], mult=8))
+        conv = lg.EquivariantConvolution(repr, edge_dim=16, hidden_dim=32, radial_weight_rank=4)
+
+        # Check that the convolution's radial weight uses low-rank
+        assert conv.rwlin.rank == 4
+
+    def test_low_rank_transformer(self):
+        """Test EquivariantTransformer with low-rank radial weights."""
+        in_repr = lg.Repr([0, 1], mult=4)
+        out_repr = lg.Repr([0, 1], mult=4)
+        hidden_repr = lg.Repr([0, 1], mult=8)
+
+        model = lg.EquivariantTransformer(
+            in_repr=in_repr,
+            out_repr=out_repr,
+            hidden_repr=hidden_repr,
+            hidden_layers=2,
+            edge_dim=8,
+            edge_hidden_dim=16,
+            k_neighbors=4,
+            nheads=2,
+            radial_weight_rank=4,
+        )
+
+        # Test forward pass works
+        N = 10
+        coords = torch.randn(N, 3)
+        features = torch.randn(N, in_repr.mult, in_repr.dim())
+        output = model(coords, features)
+
+        assert output.shape == (N, out_repr.mult, out_repr.dim())
+        assert not torch.isnan(output).any()
+
 
 # ============================================================================
 # EQUIVARIANTLINEAR TESTS
@@ -1271,14 +1413,14 @@ class TestArchitectureDiagnostics:
         block_same = lg.EquivariantTransformerBlock(
             same_repr, edge_dim=16, edge_hidden_dim=32, nheads=4
         )
-        assert block_same.skip, "Skip connection should exist when reprs match"
+        assert block_same.can_skip, "Skip connection should exist when reprs match"
 
         # Different repr should NOT have skip connection
         diff_repr = lg.ProductRepr(setup['in_repr'], setup['hidden_repr'])
         block_diff = lg.EquivariantTransformerBlock(
             diff_repr, edge_dim=16, edge_hidden_dim=32, nheads=4
         )
-        assert not block_diff.skip, "Skip connection should not exist when reprs differ"
+        assert not block_diff.can_skip, "Skip connection should not exist when reprs differ"
 
     def test_attention_weight_distribution(self):
         """Test that attention weights are well-distributed, not collapsed."""

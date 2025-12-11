@@ -176,9 +176,10 @@ class CIFDataset(Dataset):
     Args:
         cif_dir: Directory containing .cif files.
         max_atoms: Maximum number of atoms (structures with more are skipped).
+        limit: Maximum number of structures to use (None = use all).
     """
 
-    def __init__(self, cif_dir: str | Path, max_atoms: int = 1000):
+    def __init__(self, cif_dir: str | Path, max_atoms: int = 1000, limit: int | None = None):
         self.cif_dir = Path(cif_dir)
         self.max_atoms = max_atoms
 
@@ -186,6 +187,10 @@ class CIFDataset(Dataset):
         self.cif_files = sorted(self.cif_dir.glob("*.cif"))
         if not self.cif_files:
             raise ValueError(f"No .cif files found in {cif_dir}")
+
+        # Limit number of structures if requested
+        if limit is not None and limit > 0:
+            self.cif_files = self.cif_files[:limit]
 
         print(f"Found {len(self.cif_files)} CIF files in {cif_dir}")
 
@@ -196,7 +201,7 @@ class CIFDataset(Dataset):
         """Load a structure.
 
         Returns:
-            Dict with 'coords', 'atoms', 'id' or None if loading fails.
+            Dict with 'coords', 'atoms', 'id', 'coord_scale', 'polymer' or None if loading fails.
         """
         cif_file = self.cif_files[idx]
 
@@ -214,11 +219,17 @@ class CIFDataset(Dataset):
             # Center coordinates
             polymer, _ = polymer.center()
 
+            # Normalize coordinates to unit variance for stable training
+            coords = polymer.coordinates.float()
+            coord_scale = coords.std().clamp(min=1e-6)
+            coords_normalized = coords / coord_scale
+
             return {
-                "coords": polymer.coordinates.float(),
+                "coords": coords_normalized,
                 "atoms": polymer.atoms.long(),
                 "id": polymer.id(),
-                "polymer": polymer,  # Keep for ciffy.rmsd
+                "coord_scale": coord_scale,  # For un-normalizing outputs
+                "polymer": polymer,  # Keep for ciffy.rmsd (uses original coords)
             }
         except Exception as e:
             print(f"Warning: Failed to load {cif_file}: {e}")
@@ -357,6 +368,7 @@ def train_epoch(
         for structure in batch:
             coords = structure["coords"].to(device)
             atoms = structure["atoms"].to(device)
+            coord_scale = structure["coord_scale"].to(device)
 
             # Handle unknown atom types (index -1)
             atoms = atoms.clamp(min=0)
@@ -366,13 +378,15 @@ def train_epoch(
             # Forward pass
             recon, mu, logvar = model(coords, atoms)
 
-            # Extract coordinate reconstruction
-            coords_recon = model.get_coord_reconstruction(recon)
+            # Extract coordinate reconstruction and un-normalize
+            coords_recon_normalized = model.get_coord_reconstruction(recon)
+            coords_recon = coords_recon_normalized * coord_scale
 
-            # Reconstruction loss using Kabsch-aligned RMSD (proper for equivariant models)
-            pred_polymer = structure["polymer"].to(device).with_coordinates(coords_recon)
-            target_polymer = structure["polymer"].to(device)
-            recon_loss = ciffy.rmsd(target_polymer, pred_polymer, ciffy.MOLECULE)
+            # Reconstruction loss - MSE on normalized coordinates (simpler, guaranteed differentiable)
+            # This works because equivariant model + centered data = same coordinate frame
+            recon_loss = ((coords_recon_normalized - coords) ** 2).sum(dim=-1).mean()
+            # Scale to Angstroms for interpretability
+            recon_loss = recon_loss * (coord_scale ** 2)
 
             # KL divergence
             kl_loss = kl_divergence(mu, logvar)
@@ -389,11 +403,13 @@ def train_epoch(
 
             optimizer.step()
 
-            # Track metrics
+            # Track metrics (RMSD in original Angstrom scale)
             total_recon_loss += recon_loss.item()
             total_kl_loss += kl_loss.item()
             total_loss += loss.item()
-            total_rmsd += compute_rmsd(coords_recon.detach(), coords)
+            # Un-normalize target coords for RMSD comparison
+            coords_original = coords * coord_scale
+            total_rmsd += compute_rmsd(coords_recon.detach(), coords_original)
             num_structures += 1
 
             # Update progress bar
@@ -446,22 +462,24 @@ def validate(
         for structure in batch:
             coords = structure["coords"].to(device)
             atoms = structure["atoms"].to(device)
+            coord_scale = structure["coord_scale"].to(device)
             atoms = atoms.clamp(min=0)
 
             recon, mu, logvar = model(coords, atoms)
-            coords_recon = model.get_coord_reconstruction(recon)
+            coords_recon_normalized = model.get_coord_reconstruction(recon)
+            coords_recon = coords_recon_normalized * coord_scale
 
-            # Reconstruction loss using Kabsch-aligned RMSD
-            pred_polymer = structure["polymer"].to(device).with_coordinates(coords_recon)
-            target_polymer = structure["polymer"].to(device)
-            recon_loss = ciffy.rmsd(target_polymer, pred_polymer, ciffy.MOLECULE)
+            # Reconstruction loss - MSE on normalized coordinates
+            recon_loss = ((coords_recon_normalized - coords) ** 2).sum(dim=-1).mean()
+            recon_loss = recon_loss * (coord_scale ** 2)
             kl_loss = kl_divergence(mu, logvar)
             loss = recon_loss + kl_weight * kl_loss
 
             total_recon_loss += recon_loss.item()
             total_kl_loss += kl_loss.item()
             total_loss += loss.item()
-            total_rmsd += compute_rmsd(coords_recon, coords)
+            coords_original = coords * coord_scale
+            total_rmsd += compute_rmsd(coords_recon, coords_original)
             num_structures += 1
 
     if num_structures == 0:
@@ -503,12 +521,15 @@ def save_example_reconstruction(
         polymer = ciffy.load(str(cif_file), backend="torch")
         polymer, _ = polymer.center()
 
-        coords = polymer.coordinates.float().to(device)
+        coords = polymer.coordinates.float()
+        coord_scale = coords.std().clamp(min=1e-6)
+        coords_normalized = (coords / coord_scale).to(device)
         atoms = polymer.atoms.long().to(device).clamp(min=0)
 
-        # Get reconstruction
-        recon, mu, logvar = model(coords, atoms)
-        coords_recon = model.get_coord_reconstruction(recon)
+        # Get reconstruction (in normalized space, then un-normalize)
+        recon, mu, logvar = model(coords_normalized, atoms)
+        coords_recon_normalized = model.get_coord_reconstruction(recon)
+        coords_recon = coords_recon_normalized * coord_scale.to(device)
 
         # Save original (only on first epoch)
         if epoch == 1:
@@ -548,8 +569,8 @@ def main():
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-4,
-        help="Learning rate (default: 1e-4)",
+        default=1e-3,
+        help="Learning rate (default: 1e-3)",
     )
     parser.add_argument(
         "--kl-weight",
@@ -653,6 +674,12 @@ def main():
         default="training_history.json",
         help="Path to save training history (default: training_history.json)",
     )
+    parser.add_argument(
+        "--num-structures",
+        type=int,
+        default=None,
+        help="Limit number of structures (default: use all). Use 1 for overfitting test.",
+    )
 
     args = parser.parse_args()
 
@@ -667,19 +694,28 @@ def main():
     print(f"  Warmup epochs: {args.warmup_epochs}")
     print(f"  Early stopping: {args.early_stopping if args.early_stopping > 0 else 'disabled'}")
     print(f"  Gradient clipping: {args.grad_clip if args.grad_clip > 0 else 'disabled'}")
+    print(f"  Num structures: {args.num_structures if args.num_structures else 'all'}")
     print()
 
     device = torch.device(args.device)
 
     # Load dataset
-    dataset = CIFDataset(args.cif_dir, max_atoms=args.max_atoms)
+    dataset = CIFDataset(args.cif_dir, max_atoms=args.max_atoms, limit=args.num_structures)
 
     # Split into train/val
-    num_val = max(1, int(len(dataset) * args.val_split))
-    num_train = len(dataset) - num_val
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [num_train, num_val]
-    )
+    # For single-structure overfitting, use the same structure for train and val
+    if len(dataset) == 1:
+        train_dataset = dataset
+        val_dataset = dataset
+        num_train = 1
+        num_val = 1
+        print("Single structure mode: using same structure for train and val")
+    else:
+        num_val = max(1, int(len(dataset) * args.val_split))
+        num_train = len(dataset) - num_val
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            dataset, [num_train, num_val]
+        )
 
     print(f"Train structures: {num_train}")
     print(f"Val structures: {num_val}")

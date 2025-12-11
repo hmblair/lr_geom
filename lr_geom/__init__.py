@@ -15,6 +15,7 @@ Modules:
     layers: Equivariant neural network layers (convolution, attention)
     models: Pre-built geometric models (GNM functions)
     vae: SO(3)-equivariant variational autoencoder
+    config: Configuration system for experiments
 
 Optional Dependencies:
     - sphericart: Required for SphericalHarmonic
@@ -82,6 +83,16 @@ from .layers import (
     EquivariantTransformer,
 )
 
+# Configuration
+from .config import (
+    ModelConfig,
+    TrainingConfig,
+    DataConfig,
+    ExperimentConfig,
+    load_config,
+    save_config,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -121,4 +132,11 @@ __all__ = [
     "EquivariantAttention",
     "EquivariantTransformerBlock",
     "EquivariantTransformer",
+    # Configuration
+    "ModelConfig",
+    "TrainingConfig",
+    "DataConfig",
+    "ExperimentConfig",
+    "load_config",
+    "save_config",
 ]

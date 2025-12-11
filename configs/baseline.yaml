@@ -1,0 +1,47 @@
+# Baseline configuration: node-wise attention with default settings
+name: baseline_node_wise
+
+model:
+  embed_dim: 16
+  latent_mult: 8
+  hidden_mult: 32
+  encoder_layers: 4
+  decoder_layers: 4
+  k_neighbors: 16
+  nheads: 8
+  dropout: 0.1
+  attn_dropout: 0.0
+  residual_scale: 0.5
+  attention_type: node_wise
+  scale_type: sqrt_head_dim
+  skip_type: scaled
+  rbf_num_functions: 16
+  rbf_r_min: 0.0
+  rbf_r_max: 10.0
+  lmax_hidden: 1
+  lmax_latent: 1
+
+training:
+  epochs: 100
+  batch_size: 4
+  lr: 0.001
+  weight_decay: 0.0
+  kl_weight: 0.01
+  warmup_epochs: 10
+  early_stopping: 20
+  grad_clip: 1.0
+  scheduler: cosine
+  min_lr: 0.000001
+
+data:
+  data_dir: ~/data/pdb130
+  num_structures: null
+  min_atoms: 20
+  max_atoms: 700
+  train_split: 0.8
+  val_split: 0.1
+  seed: 42
+
+output_dir: outputs
+seed: 42
+device: auto

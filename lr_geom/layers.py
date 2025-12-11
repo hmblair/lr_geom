@@ -87,9 +87,19 @@ def build_knn_graph(coordinates: torch.Tensor, k: int) -> torch.Tensor:
 class RadialWeight(nn.Module):
     """Compute tensor product weights from invariant edge features.
 
-    A two-layer neural network that maps edge features to weights
-    for tensor product contractions. Used in equivariant message
-    passing networks.
+    A neural network that maps edge features to weights for tensor product
+    contractions. Used in equivariant message passing networks.
+
+    Supports two modes:
+    - Full-rank (rank=None): Direct projection to full weight matrix
+    - Low-rank (rank=k): Factorized projection A @ B where A is (nl2*out_dim, k)
+      and B is (k, nl1*in_dim), significantly reducing parameters
+
+    Parameter count comparison for output matrix of shape (M, N):
+    - Full-rank: hidden_dim * M * N
+    - Low-rank:  hidden_dim * (M * k + k * N) = hidden_dim * k * (M + N)
+
+    For M=N=64 and k=8: full-rank = 4096*h, low-rank = 1024*h (4x reduction)
 
     Args:
         edge_dim: Dimension of input edge features.
@@ -98,12 +108,18 @@ class RadialWeight(nn.Module):
         in_dim: Input multiplicity.
         out_dim: Output multiplicity.
         dropout: Dropout probability.
+        rank: Rank for low-rank decomposition. If None, uses full-rank.
 
     Example:
         >>> repr = ProductRepr(Repr([1]), Repr([1]))
+        >>> # Full-rank version
         >>> weight_net = RadialWeight(16, 32, repr, 8, 8)
+        >>> # Low-rank version with rank 4
+        >>> weight_net_lr = RadialWeight(16, 32, repr, 8, 8, rank=4)
         >>> edge_features = torch.randn(100, 16)
         >>> weights = weight_net(edge_features)
+        >>> weights_lr = weight_net_lr(edge_features)
+        >>> assert weights.shape == weights_lr.shape
     """
 
     def __init__(
@@ -114,6 +130,7 @@ class RadialWeight(nn.Module):
         in_dim: int,
         out_dim: int,
         dropout: float = 0,
+        rank: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -122,13 +139,26 @@ class RadialWeight(nn.Module):
 
         self.in_dim = in_dim
         self.out_dim = out_dim
-        self.out_dim_flat = self.nl1 * self.nl2 * in_dim * out_dim
+        self.rank = rank
+
+        # Output dimensions
+        self.out_rows = self.nl2 * out_dim  # M
+        self.out_cols = self.nl1 * in_dim   # N
 
         self.layer1 = nn.Linear(edge_dim, hidden_dim)
-        self.layer2 = nn.Linear(hidden_dim, self.out_dim_flat)
-
         self.activation = nn.GELU()
         self.dropout = nn.Dropout(dropout)
+
+        if rank is None:
+            # Full-rank: project directly to flattened output
+            self.out_dim_flat = self.out_rows * self.out_cols
+            self.layer2 = nn.Linear(hidden_dim, self.out_dim_flat)
+        else:
+            # Low-rank: project to two factors A (M x k) and B (k x N)
+            if rank < 1:
+                raise ValueError(f"rank must be positive, got {rank}")
+            self.layer_left = nn.Linear(hidden_dim, self.out_rows * rank)
+            self.layer_right = nn.Linear(hidden_dim, rank * self.out_cols)
 
         self.apply(_init_weights)
 
@@ -143,14 +173,18 @@ class RadialWeight(nn.Module):
         """
         *b, _ = x.size()
 
-        x = self.layer1(x)
-        x = self.activation(x)
-        x = self.dropout(x)
+        h = self.layer1(x)
+        h = self.activation(h)
+        h = self.dropout(h)
 
-        return self.layer2(x).view(
-            *b, self.nl2 * self.out_dim,
-            self.nl1 * self.in_dim,
-        )
+        if self.rank is None:
+            # Full-rank path
+            return self.layer2(h).view(*b, self.out_rows, self.out_cols)
+        else:
+            # Low-rank path: compute A @ B
+            left = self.layer_left(h).view(*b, self.out_rows, self.rank)
+            right = self.layer_right(h).view(*b, self.rank, self.out_cols)
+            return left @ right
 
 
 class EquivariantLinear(nn.Module):
@@ -377,10 +411,14 @@ class EquivariantConvolution(nn.Module):
         edge_dim: Dimension of invariant edge features.
         hidden_dim: Hidden dimension for radial weight network.
         dropout: Dropout probability.
+        radial_weight_rank: Rank for low-rank radial weight decomposition.
+            If None, uses full-rank weights. Lower rank reduces parameters.
 
     Example:
         >>> repr = ProductRepr(Repr([0, 1]), Repr([0, 1]))
         >>> conv = EquivariantConvolution(repr, edge_dim=16, hidden_dim=32)
+        >>> # With low-rank radial weights
+        >>> conv_lr = EquivariantConvolution(repr, edge_dim=16, hidden_dim=32, radial_weight_rank=8)
     """
 
     def __init__(
@@ -389,6 +427,7 @@ class EquivariantConvolution(nn.Module):
         edge_dim: int,
         hidden_dim: int,
         dropout: float = 0.0,
+        radial_weight_rank: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -399,6 +438,7 @@ class EquivariantConvolution(nn.Module):
             repr.rep1.mult,
             repr.rep2.mult,
             dropout,
+            rank=radial_weight_rank,
         )
 
     def forward(
@@ -596,23 +636,21 @@ class Attention(nn.Module):
 
 
 class EquivariantAttention(nn.Module):
-    """SE(3)-equivariant k-NN attention with standard attention pattern.
+    """SE(3)-equivariant k-NN attention with configurable attention pattern.
 
-    Uses node-level queries with edge-level keys and values, following the
-    standard transformer attention pattern adapted for equivariance:
+    Supports two attention variants:
 
-    Flow:
+    **node_wise** (default): Node-level queries with edge-level keys/values.
         1. Q = linear(node_features)           # Node-level, keeps input lvals
         2. K = conv(neighbor_features, edge)   # Edge-level, keeps input lvals
         3. V = conv(neighbor_features, edge)   # Edge-level, can change lvals
         4. scores = Q_i · K_ij                 # Standard Q·K attention
         5. output = softmax(scores) @ V        # Weighted sum of values
 
-    Note on lval changes:
-        - Q uses EquivariantLinear, so must keep input lvals (rep1.lvals)
-        - K must match Q's lvals for the dot product to work
-        - V can change to output lvals (rep2.lvals) - this is where lval
-          changes happen in the network
+    **edge_wise**: All Q, K, V computed as edge features via single convolution.
+        1. Q, K, V = conv(neighbor_features, edge)  # All edge-level
+        2. scores = Q_ij · K_ij                     # Per-edge dot product
+        3. output = softmax(scores) @ V             # Weighted sum of values
 
     Args:
         repr: ProductRepr specifying input (rep1) and output (rep2) representations.
@@ -621,6 +659,10 @@ class EquivariantAttention(nn.Module):
         nheads: Number of attention heads.
         dropout: Dropout for convolutions.
         attn_dropout: Dropout for attention weights.
+        attention_type: "node_wise" or "edge_wise" attention pattern.
+        scale_type: Attention scaling - "sqrt_head_dim", "sqrt_dim", "learned", or "none".
+        radial_weight_rank: Rank for low-rank radial weight decomposition.
+            If None, uses full-rank weights. Lower rank reduces parameters.
     """
 
     def __init__(
@@ -631,11 +673,21 @@ class EquivariantAttention(nn.Module):
         nheads: int = 1,
         dropout: float = 0.0,
         attn_dropout: float = 0.0,
+        attention_type: str = "node_wise",
+        scale_type: str = "sqrt_head_dim",
+        radial_weight_rank: int | None = None,
     ) -> None:
         super().__init__()
 
+        if attention_type not in ("node_wise", "edge_wise"):
+            raise ValueError(f"attention_type must be 'node_wise' or 'edge_wise', got {attention_type}")
+        if scale_type not in ("sqrt_head_dim", "sqrt_dim", "learned", "none"):
+            raise ValueError(f"scale_type must be 'sqrt_head_dim', 'sqrt_dim', 'learned', or 'none'")
+
         self.repr = repr
         self.nheads = nheads
+        self.attention_type = attention_type
+        self.scale_type = scale_type
 
         # Input/output dimensions
         in_mult = repr.rep1.mult
@@ -648,8 +700,12 @@ class EquivariantAttention(nn.Module):
         self.out_mult = out_mult
         self.out_dim = out_dim
 
-        # Attention operates in input space (Q and K must match)
-        self.attn_hidden_size = in_mult * in_dim
+        # Hidden size for attention (output space for edge_wise, input space for node_wise)
+        self.hidden_size = out_mult * out_dim
+        if attention_type == "node_wise":
+            self.attn_hidden_size = in_mult * in_dim
+        else:  # edge_wise
+            self.attn_hidden_size = out_mult * out_dim
 
         if self.attn_hidden_size % nheads != 0:
             raise ValueError(
@@ -658,27 +714,64 @@ class EquivariantAttention(nn.Module):
             )
 
         self.head_dim = self.attn_hidden_size // nheads
-        self.scale = self.head_dim ** -0.5
 
+        # Initialize scale factor based on scale_type
+        self._init_scale()
+
+        # Build attention components based on type
+        if attention_type == "node_wise":
+            self._init_node_wise(repr, edge_dim, edge_hidden_dim, dropout, radial_weight_rank)
+        else:  # edge_wise
+            self._init_edge_wise(repr, edge_dim, edge_hidden_dim, dropout, radial_weight_rank)
+
+        # Output projection (operates on rep2)
+        self.out_proj = EquivariantLinear(repr.rep2, repr.rep2, activation=None, bias=False)
+        self.attn_dropout = nn.Dropout(attn_dropout)
+
+    def _init_scale(self) -> None:
+        """Initialize attention scale factor."""
+        if self.scale_type == "sqrt_head_dim":
+            self.scale = self.head_dim ** -0.5
+        elif self.scale_type == "sqrt_dim":
+            self.scale = self.attn_hidden_size ** -0.5
+        elif self.scale_type == "learned":
+            self.scale = nn.Parameter(torch.tensor(self.head_dim ** -0.5))
+        else:  # none
+            self.scale = 1.0
+
+    def _init_node_wise(
+        self, repr: ProductRepr, edge_dim: int, edge_hidden_dim: int, dropout: float,
+        radial_weight_rank: int | None,
+    ) -> None:
+        """Initialize node_wise attention components."""
         # Q: Node-level projection (EquivariantLinear, keeps rep1 lvals)
-        # Creates a query representation of "what is this node looking for?"
         self.proj_q = EquivariantLinear(repr.rep1, repr.rep1, dropout=dropout, activation=None)
 
         # K: Edge-level convolution (keeps rep1 lvals for Q·K compatibility)
-        # Keys must have same dimension as queries for dot product
         repr_k = ProductRepr(deepcopy(repr.rep1), deepcopy(repr.rep1))
-        self.conv_k = EquivariantConvolution(repr_k, edge_dim, edge_hidden_dim, dropout)
+        self.conv_k = EquivariantConvolution(
+            repr_k, edge_dim, edge_hidden_dim, dropout, radial_weight_rank=radial_weight_rank
+        )
 
         # V: Edge-level convolution (can change to rep2 lvals)
-        # This is where the representation change happens
         repr_v = ProductRepr(deepcopy(repr.rep1), deepcopy(repr.rep2))
-        self.conv_v = EquivariantConvolution(repr_v, edge_dim, edge_hidden_dim, dropout)
+        self.conv_v = EquivariantConvolution(
+            repr_v, edge_dim, edge_hidden_dim, dropout, radial_weight_rank=radial_weight_rank
+        )
 
-        # Output projection (operates on rep2)
-        # No bias - attention should preserve zero-mean property, bias causes gradient explosion
-        self.out_proj = EquivariantLinear(repr.rep2, repr.rep2, activation=None, bias=False)
-
-        self.attn_dropout = nn.Dropout(attn_dropout)
+    def _init_edge_wise(
+        self, repr: ProductRepr, edge_dim: int, edge_hidden_dim: int, dropout: float,
+        radial_weight_rank: int | None,
+    ) -> None:
+        """Initialize edge_wise attention components."""
+        # Q, K, V all computed via single edge-level convolution
+        rep1_copy = deepcopy(repr.rep1)
+        rep2_copy = deepcopy(repr.rep2)
+        rep2_copy.mult = 3 * self.out_mult  # Q, K, V concatenated
+        repr_qkv = ProductRepr(rep1_copy, rep2_copy)
+        self.conv_qkv = EquivariantConvolution(
+            repr_qkv, edge_dim, edge_hidden_dim, dropout, radial_weight_rank=radial_weight_rank
+        )
 
     def forward(
         self: EquivariantAttention,
@@ -693,6 +786,7 @@ class EquivariantAttention(nn.Module):
 
         Args:
             basis_k: Equivariant basis for keys (rep1->rep1), shape (N, k, ...).
+                For edge_wise attention, this is ignored (uses basis_v for QKV).
             basis_v: Equivariant basis for values (rep1->rep2), shape (N, k, ...).
             edge_feats: Edge features of shape (N, k, edge_dim).
             f: Node features of shape (N, in_mult, in_dim).
@@ -702,10 +796,24 @@ class EquivariantAttention(nn.Module):
         Returns:
             Updated node features of shape (N, out_mult, out_dim).
         """
+        if self.attention_type == "node_wise":
+            return self._forward_node_wise(basis_k, basis_v, edge_feats, f, neighbor_idx, mask)
+        else:
+            return self._forward_edge_wise(basis_v, edge_feats, f, neighbor_idx, mask)
+
+    def _forward_node_wise(
+        self: EquivariantAttention,
+        basis_k: tuple[torch.Tensor, torch.Tensor],
+        basis_v: tuple[torch.Tensor, torch.Tensor],
+        edge_feats: torch.Tensor,
+        f: torch.Tensor,
+        neighbor_idx: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Node-wise attention: Q at node level, K/V at edge level."""
         N, k = neighbor_idx.shape
 
         # === Compute Queries (node-level) ===
-        # Q represents "what is node i looking for?" - independent of neighbors
         queries = self.proj_q(f)  # (N, in_mult, in_dim)
 
         # === Prepare for edge-level convolutions ===
@@ -723,48 +831,85 @@ class EquivariantAttention(nn.Module):
         b2_v_flat = b2_v.view(N * k, *b2_v.shape[2:])
 
         # === Compute Keys (edge-level, same lvals as Q) ===
-        # K_ij represents "what does neighbor j offer to node i?"
         keys = self.conv_k((b1_k_flat, b2_k_flat), edge_feats_flat, f, src_idx)
-        keys = keys.view(N, k, self.in_mult, self.in_dim)  # (N, k, in_mult, in_dim)
+        keys = keys.view(N, k, self.in_mult, self.in_dim)
 
         # === Compute Values (edge-level, can change lvals) ===
-        # V_ij is the actual information to aggregate, can have different lvals
         values = self.conv_v((b1_v_flat, b2_v_flat), edge_feats_flat, f, src_idx)
-        values = values.view(N, k, self.out_mult, self.out_dim)  # (N, k, out_mult, out_dim)
+        values = values.view(N, k, self.out_mult, self.out_dim)
 
         # === Multi-head attention ===
-        # Reshape Q: (N, in_mult, in_dim) -> (N, nheads, head_dim)
         q_heads = queries.flatten(-2, -1).view(N, self.nheads, self.head_dim)
-
-        # Reshape K: (N, k, in_mult, in_dim) -> (N, k, nheads, head_dim) -> (N, nheads, k, head_dim)
         k_heads = keys.flatten(-2, -1).view(N, k, self.nheads, self.head_dim)
-        k_heads = k_heads.transpose(1, 2)  # (N, nheads, k, head_dim)
+        k_heads = k_heads.transpose(1, 2)
 
-        # Reshape V: (N, k, out_mult, out_dim) -> (N, k, nheads, v_head_dim) -> (N, nheads, k, v_head_dim)
         v_hidden_size = self.out_mult * self.out_dim
         v_head_dim = v_hidden_size // self.nheads
         v_heads = values.flatten(-2, -1).view(N, k, self.nheads, v_head_dim)
-        v_heads = v_heads.transpose(1, 2)  # (N, nheads, k, v_head_dim)
+        v_heads = v_heads.transpose(1, 2)
 
         # === Attention scores: Q_i · K_ij ===
-        # q_heads: (N, nheads, head_dim) -> (N, nheads, 1, head_dim)
-        # k_heads: (N, nheads, k, head_dim)
-        # scores: (N, nheads, 1, k) -> (N, nheads, k)
         scores = (q_heads.unsqueeze(2) @ k_heads.transpose(-2, -1)).squeeze(2) * self.scale
 
-        # Apply mask
         if mask is not None:
             scores = scores.masked_fill(mask.unsqueeze(1), float('-inf'))
 
-        # Softmax over neighbors
-        attn_weights = F.softmax(scores, dim=-1)  # (N, nheads, k)
+        attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.attn_dropout(attn_weights)
 
         # === Weighted sum of values ===
-        # attn_weights: (N, nheads, 1, k)
-        # v_heads: (N, nheads, k, v_head_dim)
-        # output: (N, nheads, 1, v_head_dim) -> (N, nheads, v_head_dim)
         output = (attn_weights.unsqueeze(2) @ v_heads).squeeze(2)
+        output = output.view(N, self.out_mult, self.out_dim)
+
+        return self.out_proj(output)
+
+    def _forward_edge_wise(
+        self: EquivariantAttention,
+        basis: tuple[torch.Tensor, torch.Tensor],
+        edge_feats: torch.Tensor,
+        f: torch.Tensor,
+        neighbor_idx: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Edge-wise attention: Q, K, V all computed at edge level."""
+        N, k = neighbor_idx.shape
+
+        # Flatten for convolution
+        src_idx = neighbor_idx.flatten()
+        b1, b2 = basis
+        b1_flat = b1.view(N * k, *b1.shape[2:])
+        b2_flat = b2.view(N * k, *b2.shape[2:])
+        edge_feats_flat = edge_feats.view(N * k, -1)
+
+        # Compute Q, K, V as edge features via single convolution
+        qkv = self.conv_qkv((b1_flat, b2_flat), edge_feats_flat, f, src_idx)
+        qkv = qkv.view(N, k, 3 * self.out_mult, self.out_dim)
+
+        # Split into Q, K, V
+        queries, keys, values = qkv.chunk(3, dim=2)
+
+        # Reshape for multi-head attention: (N, k, nheads, head_dim)
+        q_heads = queries.flatten(-2, -1).view(N, k, self.nheads, self.head_dim)
+        k_heads = keys.flatten(-2, -1).view(N, k, self.nheads, self.head_dim)
+        v_heads = values.flatten(-2, -1).view(N, k, self.nheads, self.head_dim)
+
+        # Transpose to (N, nheads, k, head_dim)
+        q_heads = q_heads.transpose(1, 2)
+        k_heads = k_heads.transpose(1, 2)
+        v_heads = v_heads.transpose(1, 2)
+
+        # Edge attention scores: element-wise Q · K, sum over head_dim
+        scores = (q_heads * k_heads).sum(dim=-1) * self.scale
+
+        if mask is not None:
+            scores = scores.masked_fill(mask.unsqueeze(1), float('-inf'))
+
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Weight edge values and aggregate
+        weighted = attn_weights.unsqueeze(-1) * v_heads
+        output = weighted.sum(dim=2)
 
         # Reshape back to (N, out_mult, out_dim)
         output = output.view(N, self.out_mult, self.out_dim)
@@ -788,6 +933,11 @@ class EquivariantTransformerBlock(nn.Module):
         transition: Whether to include transition layer.
         residual_scale: Scale factor for residual connections. Use < 1.0
             (e.g., 0.1-0.5) for deep networks to improve gradient flow.
+        attention_type: "node_wise" or "edge_wise" attention pattern.
+        scale_type: Attention scaling strategy.
+        skip_type: Skip connection type - "scaled", "gated", or "none".
+        radial_weight_rank: Rank for low-rank radial weight decomposition.
+            If None, uses full-rank weights.
     """
 
     def __init__(
@@ -800,22 +950,38 @@ class EquivariantTransformerBlock(nn.Module):
         attn_dropout: float = 0.0,
         transition: bool = False,
         residual_scale: float = 1.0,
+        attention_type: str = "node_wise",
+        scale_type: str = "sqrt_head_dim",
+        skip_type: str = "scaled",
+        radial_weight_rank: int | None = None,
     ) -> None:
         super().__init__()
 
+        if skip_type not in ("scaled", "gated", "none"):
+            raise ValueError(f"skip_type must be 'scaled', 'gated', or 'none', got {skip_type}")
+
         self.prepr = repr
         self.residual_scale = residual_scale
+        self.skip_type = skip_type
 
         self.attn = EquivariantAttention(
-            repr, edge_dim, edge_hidden_dim, nheads, dropout, attn_dropout
+            repr, edge_dim, edge_hidden_dim, nheads, dropout, attn_dropout,
+            attention_type=attention_type, scale_type=scale_type,
+            radial_weight_rank=radial_weight_rank,
         )
 
         self.ln1 = EquivariantLayerNorm(repr.rep1)
 
-        # Check if skip connection is possible
+        # Check if skip connection is possible (requires matching dimensions)
         deg_match = repr.rep1.lvals == repr.rep2.lvals
         mult_match = repr.rep1.mult == repr.rep2.mult
-        self.skip = deg_match and mult_match
+        self.can_skip = deg_match and mult_match
+
+        # Learnable gate for gated skip connections
+        if skip_type == "gated" and self.can_skip:
+            self.gate = nn.Parameter(torch.zeros(1))
+        else:
+            self.gate = None
 
         # Optional transition layer
         if transition:
@@ -823,9 +989,28 @@ class EquivariantTransformerBlock(nn.Module):
             hidden_repr = deepcopy(repr.rep2)
             hidden_repr.mult = repr.rep2.mult * 4
             self.transition = EquivariantTransition(repr.rep2, hidden_repr)
+            # Separate gate for transition if gated
+            if skip_type == "gated" and self.can_skip:
+                self.gate_transition = nn.Parameter(torch.zeros(1))
+            else:
+                self.gate_transition = None
         else:
             self.ln2 = None
             self.transition = None
+            self.gate_transition = None
+
+    def _apply_skip(
+        self, residual: torch.Tensor, output: torch.Tensor, gate: nn.Parameter | None
+    ) -> torch.Tensor:
+        """Apply skip connection based on skip_type."""
+        if not self.can_skip or self.skip_type == "none":
+            return output
+        elif self.skip_type == "scaled":
+            return residual + self.residual_scale * output
+        elif self.skip_type == "gated":
+            g = torch.sigmoid(gate)
+            return residual * (1 - g) + output * g
+        return output
 
     def forward(
         self: EquivariantTransformerBlock,
@@ -850,22 +1035,16 @@ class EquivariantTransformerBlock(nn.Module):
             Updated node features.
         """
         # Pre-LN transformer variant
-        if self.skip:
-            features_tmp = features
-
+        residual = features
         features = self.ln1(features)
         features = self.attn(basis_k, basis_v, edge_feats, features, neighbor_idx, mask)
-
-        if self.skip:
-            features = features_tmp + self.residual_scale * features
+        features = self._apply_skip(residual, features, self.gate)
 
         if self.transition is not None:
-            if self.skip:
-                features_tmp = features
+            residual = features
             features = self.ln2(features)
             features = self.transition(features)
-            if self.skip:
-                features = features_tmp + self.residual_scale * features
+            features = self._apply_skip(residual, features, self.gate_transition)
 
         return features
 
@@ -891,6 +1070,14 @@ class EquivariantTransformer(nn.Module):
         transition: Whether to include transition layers.
         residual_scale: Scale factor for residual connections. Use < 1.0
             (e.g., 0.1-0.5) for deep networks to improve gradient flow.
+        attention_type: "node_wise" or "edge_wise" attention pattern.
+        scale_type: Attention scaling - "sqrt_head_dim", "sqrt_dim", "learned", "none".
+        skip_type: Skip connection type - "scaled", "gated", or "none".
+        rbf_type: Radial basis function type - "gaussian", "bessel", or "polynomial".
+        rbf_r_min: Minimum radius for RBF initialization.
+        rbf_r_max: Maximum radius for RBF initialization/cutoff.
+        radial_weight_rank: Rank for low-rank radial weight decomposition.
+            If None, uses full-rank weights. Lower rank significantly reduces parameters.
 
     Example:
         >>> in_repr = Repr(lvals=[0, 1], mult=4)
@@ -920,6 +1107,13 @@ class EquivariantTransformer(nn.Module):
         attn_dropout: float = 0.0,
         transition: bool = False,
         residual_scale: float = 1.0,
+        attention_type: str = "node_wise",
+        scale_type: str = "sqrt_head_dim",
+        skip_type: str = "scaled",
+        rbf_type: str = "gaussian",
+        rbf_r_min: float = 0.0,
+        rbf_r_max: float = 10.0,
+        radial_weight_rank: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -931,6 +1125,10 @@ class EquivariantTransformer(nn.Module):
         self.use_transition = transition
         self.residual_scale = residual_scale
         self.k_neighbors = k_neighbors
+        self.attention_type = attention_type
+        self.scale_type = scale_type
+        self.skip_type = skip_type
+        self.radial_weight_rank = radial_weight_rank
 
         self.in_repr = in_repr
         self.out_repr = out_repr
@@ -973,7 +1171,12 @@ class EquivariantTransformer(nn.Module):
         self.bases = EquivariantBases(*all_preprs)
 
         # Radial basis functions for edge features
-        self.rbf = RadialBasisFunctions(edge_dim)
+        self.rbf = RadialBasisFunctions(
+            edge_dim,
+            r_min=rbf_r_min,
+            r_max=rbf_r_max,
+            rbf_type=rbf_type,
+        )
 
     def _construct_layer(
         self: EquivariantTransformer,
@@ -989,6 +1192,10 @@ class EquivariantTransformer(nn.Module):
             self.attn_dropout,
             self.use_transition,
             self.residual_scale,
+            attention_type=self.attention_type,
+            scale_type=self.scale_type,
+            skip_type=self.skip_type,
+            radial_weight_rank=self.radial_weight_rank,
         )
 
     def forward(

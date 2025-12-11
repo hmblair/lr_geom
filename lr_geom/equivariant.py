@@ -187,18 +187,24 @@ class SphericalHarmonic(nn.Module):
 class RadialBasisFunctions(nn.Module):
     """Learnable radial basis function expansion.
 
-    Expands scalar distance values into a set of learnable Gaussian
-    basis functions. Useful for encoding distances in equivariant
-    networks where edge features should be rotation-invariant.
+    Expands scalar distance values into a set of basis functions.
+    Useful for encoding distances in equivariant networks where
+    edge features should be rotation-invariant.
+
+    Supports multiple RBF types:
+        - "gaussian": Standard Gaussian RBFs with learnable centers and widths
+        - "bessel": Spherical Bessel functions (smooth at boundaries)
+        - "polynomial": Polynomial envelope functions
 
     Args:
         num_functions: Number of basis functions.
         r_min: Minimum distance for center initialization.
-        r_max: Maximum distance for center initialization.
+        r_max: Maximum distance for center initialization (cutoff for bessel/polynomial).
+        rbf_type: Type of radial basis function ("gaussian", "bessel", "polynomial").
 
     Attributes:
-        mu: Learnable centers of the Gaussians, initialized evenly spaced.
-        sigma: Learnable widths of the Gaussians, initialized based on spacing.
+        mu: Learnable centers (gaussian only).
+        sigma: Learnable widths (gaussian only).
 
     Example:
         >>> rbf = RadialBasisFunctions(16, r_min=0.0, r_max=10.0)
@@ -211,6 +217,7 @@ class RadialBasisFunctions(nn.Module):
         num_functions: int,
         r_min: float = 0.0,
         r_max: float = 10.0,
+        rbf_type: str = "gaussian",
     ) -> None:
         super().__init__()
 
@@ -219,18 +226,44 @@ class RadialBasisFunctions(nn.Module):
         if r_max <= r_min:
             raise ValueError(f"r_max ({r_max}) must be greater than r_min ({r_min})")
 
-        # Initialize centers evenly spaced in [r_min, r_max]
-        self.mu = nn.Parameter(
-            torch.linspace(r_min, r_max, num_functions),
-            requires_grad=True,
-        )
+        valid_types = {"gaussian", "bessel", "polynomial"}
+        if rbf_type not in valid_types:
+            raise ValueError(f"rbf_type must be one of {valid_types}, got '{rbf_type}'")
 
-        # Initialize widths based on spacing between centers
-        spacing = (r_max - r_min) / max(num_functions - 1, 1)
-        self.sigma = nn.Parameter(
-            torch.full((num_functions,), spacing),
-            requires_grad=True,
-        )
+        self.rbf_type = rbf_type
+        self.num_functions = num_functions
+        self.r_min = r_min
+        self.r_max = r_max
+
+        if rbf_type == "gaussian":
+            # Initialize centers evenly spaced in [r_min, r_max]
+            self.mu = nn.Parameter(
+                torch.linspace(r_min, r_max, num_functions),
+                requires_grad=True,
+            )
+
+            # Initialize widths based on spacing between centers
+            spacing = (r_max - r_min) / max(num_functions - 1, 1)
+            self.sigma = nn.Parameter(
+                torch.full((num_functions,), spacing),
+                requires_grad=True,
+            )
+
+        elif rbf_type == "bessel":
+            # Spherical Bessel basis: j_0(n*pi*r/r_max)
+            # Frequencies for each basis function
+            self.register_buffer(
+                "bessel_freqs",
+                torch.arange(1, num_functions + 1, dtype=torch.float32) * math.pi / r_max,
+            )
+
+        elif rbf_type == "polynomial":
+            # Polynomial envelope with smooth cutoff
+            # Each basis function is: (1 - r/r_max)^(p+n) where n is the basis index
+            self.register_buffer(
+                "poly_powers",
+                torch.arange(2, num_functions + 2, dtype=torch.float32),
+            )
 
     def forward(self: RadialBasisFunctions, x: torch.Tensor) -> torch.Tensor:
         """Evaluate radial basis functions at input values.
@@ -241,9 +274,50 @@ class RadialBasisFunctions(nn.Module):
         Returns:
             Basis function values of shape (..., num_functions).
         """
-        # Standard Gaussian RBF: exp(-((x - mu) / sigma)^2)
+        if self.rbf_type == "gaussian":
+            return self._forward_gaussian(x)
+        elif self.rbf_type == "bessel":
+            return self._forward_bessel(x)
+        elif self.rbf_type == "polynomial":
+            return self._forward_polynomial(x)
+        else:
+            raise ValueError(f"Unknown rbf_type: {self.rbf_type}")
+
+    def _forward_gaussian(self: RadialBasisFunctions, x: torch.Tensor) -> torch.Tensor:
+        """Gaussian RBF: exp(-((x - mu) / sigma)^2)."""
         diff = (x[..., None] - self.mu) / self.sigma.abs().clamp(min=1e-6)
         return torch.exp(-diff ** 2)
+
+    def _forward_bessel(self: RadialBasisFunctions, x: torch.Tensor) -> torch.Tensor:
+        """Spherical Bessel RBF with smooth cutoff.
+
+        Uses sinc functions (spherical Bessel j_0) multiplied by
+        a smooth envelope that goes to zero at r_max.
+        """
+        # Smooth cutoff envelope: (1 - (r/r_max)^2)^2 for r < r_max, 0 otherwise
+        r_scaled = (x / self.r_max).clamp(max=1.0)
+        envelope = (1 - r_scaled ** 2) ** 2
+
+        # Spherical Bessel j_0(k*r) = sin(k*r) / (k*r)
+        # We use sinc which handles r=0 correctly
+        kr = x[..., None] * self.bessel_freqs
+        # sinc(x) = sin(pi*x) / (pi*x), so we need to adjust
+        bessel = torch.sinc(kr / math.pi)
+
+        return envelope[..., None] * bessel
+
+    def _forward_polynomial(self: RadialBasisFunctions, x: torch.Tensor) -> torch.Tensor:
+        """Polynomial envelope RBF.
+
+        Uses polynomial functions with smooth cutoff at r_max.
+        Each basis: (1 - r/r_max)^p for different powers p.
+        """
+        # Normalize to [0, 1] and clip
+        r_scaled = (x / self.r_max).clamp(min=0.0, max=1.0)
+
+        # (1 - r/r_max)^p for each power p
+        one_minus_r = 1.0 - r_scaled
+        return one_minus_r[..., None] ** self.poly_powers
 
 
 class EquivariantBasis(nn.Module):

@@ -311,11 +311,97 @@ samples = vae.sample(coords)  # (50, out_mult, out_dim)
 # - decode(R*coords, D*z) = D*decode(coords, z)    # output rotates correctly
 ```
 
+### Configuration System
+
+The library includes a YAML-based configuration system for reproducible experiments:
+
+```python
+import lr_geom as lg
+
+# Load configuration from YAML file
+config = lg.load_config("configs/baseline.yaml")
+
+# Or create programmatically
+config = lg.ExperimentConfig(
+    name="my_experiment",
+    model=lg.ModelConfig(
+        embed_dim=16,
+        hidden_mult=32,
+        attention_type="edge_wise",  # or "node_wise"
+        scale_type="learned",        # or "sqrt_head_dim", "sqrt_dim", "none"
+        skip_type="gated",           # or "scaled", "none"
+        rbf_type="bessel",           # or "gaussian", "polynomial"
+    ),
+    training=lg.TrainingConfig(
+        epochs=100,
+        lr=1e-3,
+        scheduler="cosine",
+    ),
+)
+
+# Save configuration
+lg.save_config(config, "my_config.yaml")
+```
+
+Run experiments from config files:
+
+```bash
+python examples/run_experiment.py --config configs/baseline.yaml
+python examples/run_experiment.py --config configs/edge_wise.yaml --epochs 50
+```
+
+### Configurable Attention and Layers
+
+The transformer layers support multiple attention and architecture variants:
+
+```python
+import lr_geom as lg
+
+# Attention types:
+# - "node_wise": Q computed at nodes, K/V at edges (default)
+# - "edge_wise": Q, K, V all computed as edge features
+
+# Scale types for attention:
+# - "sqrt_head_dim": 1/sqrt(head_dim) (default, standard transformer)
+# - "sqrt_dim": 1/sqrt(hidden_dim)
+# - "learned": learnable scalar parameter
+# - "none": no scaling
+
+# Skip connection types:
+# - "scaled": residual + scale * output (default)
+# - "gated": learnable sigmoid gate mixing residual and output
+# - "none": no skip connection
+
+# RBF types for edge features:
+# - "gaussian": learnable Gaussian basis functions (default)
+# - "bessel": spherical Bessel functions with smooth cutoff
+# - "polynomial": polynomial envelope functions
+
+model = lg.EquivariantTransformer(
+    in_repr=lg.Repr([0, 1], mult=4),
+    out_repr=lg.Repr([0, 1], mult=1),
+    hidden_repr=lg.Repr([0, 1], mult=16),
+    hidden_layers=4,
+    k_neighbors=16,
+    edge_dim=16,
+    edge_hidden_dim=32,
+    nheads=4,
+    # Configuration options
+    attention_type="node_wise",
+    scale_type="sqrt_head_dim",
+    skip_type="scaled",
+    rbf_type="gaussian",
+    rbf_r_min=0.0,
+    rbf_r_max=10.0,
+)
+```
+
 ## Package Structure
 
 ```
 lr_geom/
 ├── alignment.py       - Point cloud alignment (Kabsch, RMSD)
+├── config.py          - Configuration system (dataclasses, YAML I/O)
 ├── representations.py - SO(3) representation theory (Irrep, Repr, Wigner D-matrices)
 ├── equivariant.py     - Equivariant primitives (SphericalHarmonic, RadialBasisFunctions)
 ├── layers.py          - Equivariant layers (Linear, Attention, Transformer)
@@ -324,6 +410,16 @@ lr_geom/
 └── vae/               - SO(3)-equivariant variational autoencoder
     ├── __init__.py
     └── model.py       - EquivariantVAE, VariationalHead, losses
+
+configs/               - Example configuration files
+├── baseline.yaml      - Node-wise attention baseline
+├── edge_wise.yaml     - Edge-wise attention variant
+├── gated_skip.yaml    - Gated skip connections
+└── learned_scale.yaml - Learned attention scaling
+
+examples/
+├── run_experiment.py  - Config-based experiment runner
+└── ...
 ```
 
 ## API Reference
@@ -369,6 +465,17 @@ lr_geom/
 | `rmsd(x, y)` | Root mean square deviation |
 | `kabsch_align(x, y)` | Optimal rotation alignment |
 | `RMSD` | RMSD as nn.Module loss |
+
+### Configuration
+
+| Class/Function | Description |
+|----------------|-------------|
+| `ModelConfig` | Architecture parameters (attention_type, scale_type, skip_type, rbf_type) |
+| `TrainingConfig` | Training hyperparameters (epochs, lr, scheduler) |
+| `DataConfig` | Data loading settings |
+| `ExperimentConfig` | Complete experiment specification |
+| `load_config(path)` | Load configuration from YAML file |
+| `save_config(config, path)` | Save configuration to YAML file |
 
 ## License
 

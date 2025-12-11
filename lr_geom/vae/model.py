@@ -167,9 +167,16 @@ class EquivariantVAE(nn.Module):
         edge_hidden_dim: Hidden dimension for edge MLP. Defaults to 32.
         nheads: Number of attention heads. Defaults to 4.
         dropout: Dropout probability. Defaults to 0.0.
+        attn_dropout: Attention dropout probability. Defaults to 0.0.
         var_hidden_dim: Hidden dimension for variational head MLP. Defaults to 64.
         residual_scale: Scale factor for residual connections. Use < 1.0
             (e.g., 0.1-0.5) for deep networks to improve gradient flow.
+        attention_type: "node_wise" or "edge_wise" attention pattern. Defaults to "node_wise".
+        scale_type: Attention scaling - "sqrt_head_dim", "sqrt_dim", "learned", "none".
+        skip_type: Skip connection type - "scaled", "gated", or "none".
+        rbf_type: Radial basis function type - "gaussian", "bessel", or "polynomial".
+        rbf_r_min: Minimum radius for RBF initialization.
+        rbf_r_max: Maximum radius for RBF initialization/cutoff.
 
     Example:
         >>> in_repr = Repr([0, 1], mult=8)
@@ -203,8 +210,15 @@ class EquivariantVAE(nn.Module):
         edge_hidden_dim: int = 32,
         nheads: int = 4,
         dropout: float = 0.0,
+        attn_dropout: float = 0.0,
         var_hidden_dim: int = 64,
         residual_scale: float = 1.0,
+        attention_type: str = "node_wise",
+        scale_type: str = "sqrt_head_dim",
+        skip_type: str = "scaled",
+        rbf_type: str = "gaussian",
+        rbf_r_min: float = 0.0,
+        rbf_r_max: float = 10.0,
     ) -> None:
         super().__init__()
         self.in_repr = in_repr
@@ -223,7 +237,14 @@ class EquivariantVAE(nn.Module):
             edge_hidden_dim=edge_hidden_dim,
             nheads=nheads,
             dropout=dropout,
+            attn_dropout=attn_dropout,
             residual_scale=residual_scale,
+            attention_type=attention_type,
+            scale_type=scale_type,
+            skip_type=skip_type,
+            rbf_type=rbf_type,
+            rbf_r_min=rbf_r_min,
+            rbf_r_max=rbf_r_max,
         )
 
         # Variational head
@@ -242,7 +263,14 @@ class EquivariantVAE(nn.Module):
             edge_hidden_dim=edge_hidden_dim,
             nheads=nheads,
             dropout=dropout,
+            attn_dropout=attn_dropout,
             residual_scale=residual_scale,
+            attention_type=attention_type,
+            scale_type=scale_type,
+            skip_type=skip_type,
+            rbf_type=rbf_type,
+            rbf_r_min=rbf_r_min,
+            rbf_r_max=rbf_r_max,
         )
 
     def encode(
