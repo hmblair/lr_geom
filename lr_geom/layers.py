@@ -675,7 +675,8 @@ class EquivariantAttention(nn.Module):
         self.conv_v = EquivariantConvolution(repr_v, edge_dim, edge_hidden_dim, dropout)
 
         # Output projection (operates on rep2)
-        self.out_proj = EquivariantLinear(repr.rep2, repr.rep2, activation=None)
+        # No bias - attention should preserve zero-mean property, bias causes gradient explosion
+        self.out_proj = EquivariantLinear(repr.rep2, repr.rep2, activation=None, bias=False)
 
         self.attn_dropout = nn.Dropout(attn_dropout)
 
