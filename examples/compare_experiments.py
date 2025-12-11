@@ -15,10 +15,10 @@ Usage:
         --data_dir /path/to/structures \\
         --gpus 0,1,2,3
 
-Runs 12 experiments in parallel:
+Runs 6 experiments in parallel:
 - Node-wise vs Edge-wise attention
-- k=16, 64, 128
-- Full rank vs rank=16
+- k=64 (fixed)
+- rank=4, 8, 16
 """
 from __future__ import annotations
 
@@ -34,21 +34,16 @@ from typing import Any
 import torch
 
 # Experiment configurations to compare
+# Fixed k=64, sweep rank=4,8,16, compare node-wise vs edge-wise attention
 EXPERIMENT_GRID = [
     # Node-wise attention (Q at node, K/V at edge)
-    {"name": "node_k16_fullrank", "k_neighbors": 16, "radial_weight_rank": None, "attention_type": "node_wise"},
-    {"name": "node_k16_rank16", "k_neighbors": 16, "radial_weight_rank": 16, "attention_type": "node_wise"},
-    {"name": "node_k64_fullrank", "k_neighbors": 64, "radial_weight_rank": None, "attention_type": "node_wise"},
-    {"name": "node_k64_rank16", "k_neighbors": 64, "radial_weight_rank": 16, "attention_type": "node_wise"},
-    {"name": "node_k128_fullrank", "k_neighbors": 128, "radial_weight_rank": None, "attention_type": "node_wise"},
-    {"name": "node_k128_rank16", "k_neighbors": 128, "radial_weight_rank": 16, "attention_type": "node_wise"},
+    {"name": "node_rank4", "k_neighbors": 64, "radial_weight_rank": 4, "attention_type": "node_wise"},
+    {"name": "node_rank8", "k_neighbors": 64, "radial_weight_rank": 8, "attention_type": "node_wise"},
+    {"name": "node_rank16", "k_neighbors": 64, "radial_weight_rank": 16, "attention_type": "node_wise"},
     # Edge-wise attention (Q/K/V all at edge)
-    {"name": "edge_k16_fullrank", "k_neighbors": 16, "radial_weight_rank": None, "attention_type": "edge_wise"},
-    {"name": "edge_k16_rank16", "k_neighbors": 16, "radial_weight_rank": 16, "attention_type": "edge_wise"},
-    {"name": "edge_k64_fullrank", "k_neighbors": 64, "radial_weight_rank": None, "attention_type": "edge_wise"},
-    {"name": "edge_k64_rank16", "k_neighbors": 64, "radial_weight_rank": 16, "attention_type": "edge_wise"},
-    {"name": "edge_k128_fullrank", "k_neighbors": 128, "radial_weight_rank": None, "attention_type": "edge_wise"},
-    {"name": "edge_k128_rank16", "k_neighbors": 128, "radial_weight_rank": 16, "attention_type": "edge_wise"},
+    {"name": "edge_rank4", "k_neighbors": 64, "radial_weight_rank": 4, "attention_type": "edge_wise"},
+    {"name": "edge_rank8", "k_neighbors": 64, "radial_weight_rank": 8, "attention_type": "edge_wise"},
+    {"name": "edge_rank16", "k_neighbors": 64, "radial_weight_rank": 16, "attention_type": "edge_wise"},
 ]
 
 
