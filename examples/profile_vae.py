@@ -312,23 +312,22 @@ class LayerProfiler:
 
     def profile_attention(self) -> ProfileResult:
         """Profile Attention (scalar attention module)."""
+        # Attention takes hidden_size (must be divisible by nheads)
+        hidden_size = self.config.nheads * 8  # 8 per head
         attn = Attention(
-            dim=self.hidden_repr.mult,
+            hidden_size=hidden_size,
             nheads=self.config.nheads,
         ).to(self.device)
 
-        # Create Q, K, V tensors (N, k, mult)
-        q = torch.randn(
-            self.config.n_atoms, self.config.k_neighbors, self.hidden_repr.mult,
-            device=self.device
-        )
-        k = torch.randn_like(q)
-        v = torch.randn_like(q)
+        # Create K, Q, V tensors of shape (N, hidden_size)
+        keys = torch.randn(self.config.n_atoms, hidden_size, device=self.device)
+        queries = torch.randn_like(keys)
+        values = torch.randn_like(keys)
 
         return self._profile_forward(
             "Attention (scalar)",
             attn,
-            lambda: attn(q, k, v),
+            lambda: attn(keys, queries, values, self.neighbor_idx),
         )
 
     def profile_equivariant_convolution(self) -> ProfileResult:
@@ -336,29 +335,31 @@ class LayerProfiler:
         prod_repr = lg.ProductRepr(self.hidden_repr, self.hidden_repr)
         edge_dim = 16
 
+        # EquivariantConvolution(repr, edge_dim, hidden_dim, dropout, radial_weight_rank)
         conv = EquivariantConvolution(
             prod_repr,
             edge_dim=edge_dim,
-            edge_hidden_dim=32,
-            in_dim=self.hidden_repr.mult,
-            out_dim=self.hidden_repr.mult,
+            hidden_dim=32,
             radial_weight_rank=self.config.radial_weight_rank,
         ).to(self.device)
 
-        # Create basis and edge features
+        # Create basis (returns tuple of two tensors) and edge features
         basis_mod = EquivariantBasis(prod_repr).to(self.device)
         rbf = RadialBasisFunctions(edge_dim).to(self.device)
 
+        # Flatten displacements for basis computation
         unit_vecs = self.displacements / (self.distances.unsqueeze(-1) + 1e-8)
-        basis = basis_mod(unit_vecs.reshape(-1, 3)).reshape(
-            self.config.n_atoms, self.config.k_neighbors, -1
-        )
-        edge_feats = rbf(self.distances)
+        unit_vecs_flat = unit_vecs.reshape(-1, 3)  # (N*k, 3)
+        bases = basis_mod(unit_vecs_flat)  # tuple of (N*k, ...) tensors
+
+        # Flatten edge features and create source indices
+        edge_feats_flat = rbf(self.distances).view(-1, edge_dim)  # (N*k, edge_dim)
+        src_idx = self.neighbor_idx.flatten()  # (N*k,)
 
         return self._profile_forward(
             f"EquivariantConvolution (rank={self.config.radial_weight_rank or 'full'})",
             conv,
-            lambda: conv(basis, edge_feats, self.features_hidden, self.neighbor_idx),
+            lambda: conv(bases, edge_feats_flat, self.features_hidden, src_idx),
         )
 
     def profile_equivariant_attention(self) -> ProfileResult:
@@ -375,20 +376,24 @@ class LayerProfiler:
             radial_weight_rank=self.config.radial_weight_rank,
         ).to(self.device)
 
-        # Create basis and edge features
+        # Create bases (need two: basis_k for keys, basis_v for values)
+        # For self-attention with same in/out repr, they're the same
         basis_mod = EquivariantBasis(prod_repr).to(self.device)
         rbf = RadialBasisFunctions(edge_dim).to(self.device)
 
         unit_vecs = self.displacements / (self.distances.unsqueeze(-1) + 1e-8)
-        basis = basis_mod(unit_vecs.reshape(-1, 3)).reshape(
-            self.config.n_atoms, self.config.k_neighbors, -1
-        )
-        edge_feats = rbf(self.distances)
+        # Get basis tuple and reshape each component to (N, k, ...)
+        b1, b2 = basis_mod(unit_vecs.reshape(-1, 3))
+        n, k = self.config.n_atoms, self.config.k_neighbors
+        basis_k = (b1.view(n, k, *b1.shape[1:]), b2.view(n, k, *b2.shape[1:]))
+        basis_v = basis_k  # Same for self-attention
+
+        edge_feats = rbf(self.distances)  # (N, k, edge_dim)
 
         return self._profile_forward(
             f"EquivariantAttention ({self.config.attention_type})",
             attn,
-            lambda: attn(basis, edge_feats, self.features_hidden, self.neighbor_idx),
+            lambda: attn(basis_k, basis_v, edge_feats, self.features_hidden, self.neighbor_idx),
         )
 
     def profile_transformer_block(self) -> ProfileResult:
@@ -405,20 +410,23 @@ class LayerProfiler:
             radial_weight_rank=self.config.radial_weight_rank,
         ).to(self.device)
 
-        # Create basis and edge features
+        # Create bases (need two: basis_k for keys, basis_v for values)
         basis_mod = EquivariantBasis(prod_repr).to(self.device)
         rbf = RadialBasisFunctions(edge_dim).to(self.device)
 
         unit_vecs = self.displacements / (self.distances.unsqueeze(-1) + 1e-8)
-        basis = basis_mod(unit_vecs.reshape(-1, 3)).reshape(
-            self.config.n_atoms, self.config.k_neighbors, -1
-        )
-        edge_feats = rbf(self.distances)
+        # Get basis tuple and reshape each component to (N, k, ...)
+        b1, b2 = basis_mod(unit_vecs.reshape(-1, 3))
+        n, k = self.config.n_atoms, self.config.k_neighbors
+        basis_k = (b1.view(n, k, *b1.shape[1:]), b2.view(n, k, *b2.shape[1:]))
+        basis_v = basis_k  # Same for self-attention
+
+        edge_feats = rbf(self.distances)  # (N, k, edge_dim)
 
         return self._profile_forward(
             f"EquivariantTransformerBlock ({self.config.attention_type})",
             block,
-            lambda: block(basis, edge_feats, self.features_hidden, self.neighbor_idx),
+            lambda: block(basis_k, basis_v, self.features_hidden, edge_feats, self.neighbor_idx),
         )
 
     def profile_transformer(self) -> ProfileResult:
