@@ -638,8 +638,11 @@ class EquivariantAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
 
         # Q, K, V via equivariant convolution (all edge-level)
-        repr_qkv = deepcopy(repr)
-        repr_qkv.rep2.mult = 3 * out_mult  # Q, K, V concatenated
+        # Must deepcopy rep1 and rep2 separately to avoid shared object mutation
+        rep1_copy = deepcopy(repr.rep1)
+        rep2_copy = deepcopy(repr.rep2)
+        rep2_copy.mult = 3 * out_mult  # Q, K, V concatenated
+        repr_qkv = ProductRepr(rep1_copy, rep2_copy)
         self.conv_qkv = EquivariantConvolution(repr_qkv, edge_dim, edge_hidden_dim, dropout)
 
         # Output projection
