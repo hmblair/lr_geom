@@ -78,8 +78,8 @@ class ModelConfig:
     # Low-rank decomposition
     radial_weight_rank: int | None = None  # None = full rank
 
-    # Compilation (disabled by default due to RepNorm dynamic slicing issues)
-    use_compile: bool = False
+    # Compilation (uses torch.compile for ~2x speedup)
+    use_compile: bool = True
 
     # Representation configuration
     lmax_hidden: int = 1

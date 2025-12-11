@@ -65,12 +65,14 @@ class RepNorm(nn.Module):
     def __init__(self: RepNorm, repr: Repr) -> None:
         super().__init__()
         self.nreps = repr.nreps()
-        # Store slices for efficient indexing
+        # Store split sizes for torch.split (compile-friendly)
         cdims = repr.cumdims()
-        self.slices = [(cdims[i], cdims[i + 1]) for i in range(self.nreps)]
+        self.split_sizes = [cdims[i + 1] - cdims[i] for i in range(self.nreps)]
 
     def forward(self: RepNorm, st: torch.Tensor) -> torch.Tensor:
         """Compute the norm of each irrep component.
+
+        Uses torch.split + stack for torch.compile compatibility.
 
         Args:
             st: Spherical tensor of shape (..., dim).
@@ -78,15 +80,10 @@ class RepNorm(nn.Module):
         Returns:
             Norms of shape (..., nreps).
         """
-        norms = torch.zeros(
-            st.shape[:-1] + (self.nreps,),
-            device=st.device,
-            dtype=st.dtype,
-        )
-
-        for i, (low, high) in enumerate(self.slices):
-            norms[..., i] = st[..., low:high].norm(dim=-1)
-
+        # Split along last dimension into irrep components
+        components = torch.split(st, self.split_sizes, dim=-1)
+        # Compute norm of each component and stack
+        norms = torch.stack([c.norm(dim=-1) for c in components], dim=-1)
         return norms
 
 
