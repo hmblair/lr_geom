@@ -15,10 +15,10 @@ Usage:
         --data_dir /path/to/structures \\
         --gpus 0,1,2,3
 
-Runs 3 experiments in parallel:
-- k=16, full_rank
-- k=64, full_rank
-- k=128, full_rank
+Runs 6 experiments in parallel:
+- k=16, full_rank and rank=16
+- k=64, full_rank and rank=16
+- k=128, full_rank and rank=16
 """
 from __future__ import annotations
 
@@ -36,8 +36,11 @@ import torch
 # Experiment configurations to compare
 EXPERIMENT_GRID = [
     {"name": "k16_fullrank", "k_neighbors": 16, "radial_weight_rank": None},
+    {"name": "k16_rank16", "k_neighbors": 16, "radial_weight_rank": 16},
     {"name": "k64_fullrank", "k_neighbors": 64, "radial_weight_rank": None},
+    {"name": "k64_rank16", "k_neighbors": 64, "radial_weight_rank": 16},
     {"name": "k128_fullrank", "k_neighbors": 128, "radial_weight_rank": None},
+    {"name": "k128_rank16", "k_neighbors": 128, "radial_weight_rank": 16},
 ]
 
 
