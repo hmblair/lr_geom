@@ -177,6 +177,7 @@ class EquivariantVAE(nn.Module):
         rbf_type: Radial basis function type - "gaussian", "bessel", or "polynomial".
         rbf_r_min: Minimum radius for RBF initialization.
         rbf_r_max: Maximum radius for RBF initialization/cutoff.
+        radial_weight_rank: Rank for low-rank RadialWeight decomposition. None for full rank.
 
     Example:
         >>> in_repr = Repr([0, 1], mult=8)
@@ -219,6 +220,7 @@ class EquivariantVAE(nn.Module):
         rbf_type: str = "gaussian",
         rbf_r_min: float = 0.0,
         rbf_r_max: float = 10.0,
+        radial_weight_rank: int | None = None,
     ) -> None:
         super().__init__()
         self.in_repr = in_repr
@@ -245,6 +247,7 @@ class EquivariantVAE(nn.Module):
             rbf_type=rbf_type,
             rbf_r_min=rbf_r_min,
             rbf_r_max=rbf_r_max,
+            radial_weight_rank=radial_weight_rank,
         )
 
         # Variational head
@@ -271,6 +274,7 @@ class EquivariantVAE(nn.Module):
             rbf_type=rbf_type,
             rbf_r_min=rbf_r_min,
             rbf_r_max=rbf_r_max,
+            radial_weight_rank=radial_weight_rank,
         )
 
     def encode(
