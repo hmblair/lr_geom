@@ -410,8 +410,8 @@ class TestEquivariantConvolution:
         )
         output_rotated = output_original @ D.T
 
-        # Use relaxed tolerance due to output_scale amplifying numerical errors
-        assert torch.allclose(output_from_rotated, output_rotated, rtol=1e-3, atol=1e-3)
+        # Slightly relaxed tolerance due to larger output scale from SH normalization
+        assert torch.allclose(output_from_rotated, output_rotated, rtol=1e-3, atol=5e-4)
 
     def test_backward_gradients(self, conv_setup):
         """Test gradients flow correctly."""
@@ -470,8 +470,8 @@ class TestEquivariantConvolution:
         output_original = layer(bases, edge_features, node_features, src_idx)
         output_rotated = output_original @ D_out.T
 
-        # Use slightly relaxed tolerance due to output_scale amplifying numerical errors
-        assert torch.allclose(output_from_rotated, output_rotated, rtol=1e-3, atol=1e-3), \
+        # Slightly relaxed tolerance due to larger output scale from SH normalization
+        assert torch.allclose(output_from_rotated, output_rotated, rtol=1e-3, atol=5e-4), \
             f"Max diff: {(output_from_rotated - output_rotated).abs().max()}"
 
 

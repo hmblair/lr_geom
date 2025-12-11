@@ -13,6 +13,7 @@ Classes:
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -308,11 +309,16 @@ class EquivariantBasis(nn.Module):
         coeff1 = torch.zeros(x.size(0), *self.outdims1, device=x.device, dtype=x.dtype)
         coeff2 = torch.zeros(x.size(0), *self.outdims2, device=x.device, dtype=x.dtype)
 
+        # Normalize SH values to unit RMS for each l-degree
+        # Standard real SH have: Y_l^m ~ 1/sqrt(4*pi) for l=0, different scales for l>0
+        # We scale by sqrt(4*pi) to make RMS ≈ 1 (exact for uniform directions)
+        sh_normalized = sh * math.sqrt(4 * math.pi)
+
         for c_low, c_high, sh_low, sh_high, j in self.slices1:
-            coeff1[..., c_low:c_high, j] = sh[..., sh_low:sh_high]
+            coeff1[..., c_low:c_high, j] = sh_normalized[..., sh_low:sh_high]
 
         for c_low, c_high, sh_low, sh_high, j in self.slices2:
-            coeff2[..., j, c_low:c_high] = sh[..., sh_low:sh_high]
+            coeff2[..., j, c_low:c_high] = sh_normalized[..., sh_low:sh_high]
 
         return coeff1, coeff2
 
