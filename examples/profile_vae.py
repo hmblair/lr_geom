@@ -431,11 +431,14 @@ class LayerProfiler:
 
     def profile_transformer(self) -> ProfileResult:
         """Profile EquivariantTransformer."""
+        edge_dim = 16
         transformer = EquivariantTransformer(
             in_repr=self.in_repr,
             out_repr=self.hidden_repr,
             hidden_repr=self.hidden_repr,
             hidden_layers=2,
+            edge_dim=edge_dim,
+            edge_hidden_dim=32,
             k_neighbors=self.config.k_neighbors,
             nheads=self.config.nheads,
             attention_type=self.config.attention_type,
