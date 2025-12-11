@@ -146,8 +146,8 @@ def diagnose():
     hooks.append(vae.encoder.proj.register_forward_hook(make_hook("enc.proj")))
 
     # Variational head
-    hooks.append(vae.var_head.mu_proj.register_forward_hook(make_hook("var_head.mu")))
-    hooks.append(vae.var_head.logvar_net.register_forward_hook(make_hook("var_head.logvar")))
+    hooks.append(vae.var_head.mu_head.register_forward_hook(make_hook("var_head.mu")))
+    hooks.append(vae.var_head.logvar_head.register_forward_hook(make_hook("var_head.logvar")))
 
     # Decoder layers
     for i, layer in enumerate(vae.decoder.layers):
