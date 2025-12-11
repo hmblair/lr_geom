@@ -432,8 +432,8 @@ def diagnose():
         mse = ((coords_pred - s["coords"]) ** 2).mean()
 
         # Compute Kabsch-aligned RMSD using ciffy (proper structural comparison)
-        # Denormalize predictions back to original scale
-        coords_pred_angstrom = coords_pred * s["coord_scale"]
+        # Denormalize predictions back to original scale and move to CPU for ciffy
+        coords_pred_angstrom = (coords_pred * s["coord_scale"]).cpu()
         pred_polymer = s["polymer"].with_coordinates(coords_pred_angstrom)
         kabsch_rmsd_sq = ciffy.rmsd(s["polymer"], pred_polymer, ciffy.MOLECULE)
         kabsch_rmsd = kabsch_rmsd_sq.sqrt().item()
