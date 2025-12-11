@@ -131,107 +131,112 @@ def diagnose():
         print_stats("atoms (input)", atoms.float())
         print_stats("features (embedded)", features)
 
-        # 2. Encoder input projection
-        print("\n2. ENCODER INPUT PROJECTION")
-        enc_input = vae.encoder.input_proj(features)
-        print_stats("encoder input_proj output", enc_input)
-
-        # 3. Encoder layers
-        print("\n3. ENCODER LAYERS")
-        # We need to manually trace through encoder
+        # 2. Encoder - trace through layers
+        print("\n2. ENCODER LAYERS")
         enc = vae.encoder
         neighbor_idx = lg.build_knn_graph(coords, enc.k_neighbors)
         displacements = coords[neighbor_idx] - coords.unsqueeze(1)
-        edge_features = enc.rbf(displacements.norm(dim=-1))
+        edge_feats = enc.rbf(displacements.norm(dim=-1))
         all_bases = enc.bases(displacements)
 
-        x = enc_input
+        print_stats("edge_features (RBF)", edge_feats)
+
+        x = features
         for i, block in enumerate(enc.layers):
-            # Get bases for this layer
             basis_k = all_bases[2 * i]
             basis_v = all_bases[2 * i + 1]
 
-            # Attention
+            print(f"\n  --- Encoder Layer {i} ---")
+            print_stats(f"  input", x)
+
+            # LayerNorm
             x_ln = block.ln1(x)
-            print_stats(f"  layer {i} after ln1", x_ln)
+            print_stats(f"  after ln1", x_ln)
 
-            attn_out = block.attn(x_ln, neighbor_idx, edge_features, basis_k, basis_v)
-            print_stats(f"  layer {i} attn output", attn_out)
+            # Attention
+            attn_out = block.attn(x_ln, neighbor_idx, edge_feats, basis_k, basis_v)
+            print_stats(f"  attn output", attn_out)
 
+            # Residual
             if block.skip:
                 x = attn_out + block.residual_scale * x
+                print_stats(f"  after residual (skip={block.skip})", x)
             else:
                 x = attn_out
-            print_stats(f"  layer {i} after residual", x)
+                print_stats(f"  after residual (skip={block.skip}, no add)", x)
 
-            # Transition (if present)
+            # Transition
             if block.transition is not None:
                 x_ln2 = block.ln2(x)
                 trans_out = block.transition(x_ln2)
                 x = trans_out + block.residual_scale * x
-                print_stats(f"  layer {i} after transition", x)
+                print_stats(f"  after transition", x)
 
         encoder_output = enc.final_ln(x)
-        print_stats("encoder final output", encoder_output)
+        print_stats("\nencoder final_ln output", encoder_output)
 
-        # 4. Variational head
-        print("\n4. VARIATIONAL HEAD")
-        mu = vae.var_head.mu_proj(encoder_output)
+        # Output projection
+        encoder_final = enc.proj(encoder_output)
+        print_stats("encoder proj output", encoder_final)
+
+        # 3. Variational head
+        print("\n3. VARIATIONAL HEAD")
+        mu = vae.var_head.mu_proj(encoder_final)
         print_stats("mu", mu)
 
-        norms = lg.RepNorm(vae.var_head.in_repr)(encoder_output)
+        norms = lg.RepNorm(vae.var_head.in_repr)(encoder_final)
         print_stats("norms for logvar", norms)
         logvar = vae.var_head.logvar_net(norms)
         print_stats("logvar", logvar)
 
-        # 5. Reparameterization
-        print("\n5. REPARAMETERIZATION")
+        # 4. Reparameterization
+        print("\n4. REPARAMETERIZATION")
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(mu)
         z = mu + std.unsqueeze(-1) * eps
         print_stats("z (latent)", z)
 
-        # 6. Decoder
-        print("\n6. DECODER")
+        # 5. Decoder
+        print("\n5. DECODER LAYERS")
         dec = vae.decoder
-        dec_input = dec.input_proj(z)
-        print_stats("decoder input_proj output", dec_input)
-
-        # Decoder uses same graph structure
         dec_neighbor_idx = lg.build_knn_graph(coords, dec.k_neighbors)
         dec_displacements = coords[dec_neighbor_idx] - coords.unsqueeze(1)
-        dec_edge_features = dec.rbf(dec_displacements.norm(dim=-1))
+        dec_edge_feats = dec.rbf(dec_displacements.norm(dim=-1))
         dec_all_bases = dec.bases(dec_displacements)
 
-        y = dec_input
+        y = z
         for i, block in enumerate(dec.layers):
             basis_k = dec_all_bases[2 * i]
             basis_v = dec_all_bases[2 * i + 1]
 
-            y_ln = block.ln1(y)
-            print_stats(f"  layer {i} after ln1", y_ln)
+            print(f"\n  --- Decoder Layer {i} ---")
+            print_stats(f"  input", y)
 
-            attn_out = block.attn(y_ln, dec_neighbor_idx, dec_edge_features, basis_k, basis_v)
-            print_stats(f"  layer {i} attn output", attn_out)
+            y_ln = block.ln1(y)
+            print_stats(f"  after ln1", y_ln)
+
+            attn_out = block.attn(y_ln, dec_neighbor_idx, dec_edge_feats, basis_k, basis_v)
+            print_stats(f"  attn output", attn_out)
 
             if block.skip:
                 y = attn_out + block.residual_scale * y
+                print_stats(f"  after residual (skip={block.skip})", y)
             else:
                 y = attn_out
-            print_stats(f"  layer {i} after residual", y)
+                print_stats(f"  after residual (skip={block.skip}, no add)", y)
 
             if block.transition is not None:
                 y_ln2 = block.ln2(y)
                 trans_out = block.transition(y_ln2)
                 y = trans_out + block.residual_scale * y
-                print_stats(f"  layer {i} after transition", y)
+                print_stats(f"  after transition", y)
 
         decoder_output = dec.final_ln(y)
-        print_stats("decoder final_ln output", decoder_output)
+        print_stats("\ndecoder final_ln output", decoder_output)
 
-        # 7. Output projection
-        print("\n7. OUTPUT PROJECTION")
-        recon = dec.output_proj(decoder_output)
+        # 6. Output projection
+        print("\n6. OUTPUT PROJECTION")
+        recon = dec.proj(decoder_output)
         print_stats("final reconstruction", recon)
 
         coords_pred = recon[:, 0, :]
