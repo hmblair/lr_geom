@@ -78,6 +78,9 @@ class ModelConfig:
     # Low-rank decomposition
     radial_weight_rank: int | None = None  # None = full rank
 
+    # Compilation
+    use_compile: bool = True  # Use torch.compile for ~2x speedup
+
     # Representation configuration
     lmax_hidden: int = 1
     lmax_latent: int = 1
@@ -356,8 +359,13 @@ def merge_config_with_args(
 
     # Override with non-None args
     args_dict = vars(args)
+
+    # Handle special case: --no-compile flag maps to use_compile=False
+    if args_dict.get("no_compile"):
+        config_dict["model"]["use_compile"] = False
+
     for key, value in args_dict.items():
-        if value is not None:
+        if value is not None and key != "no_compile":
             # Try to find the right nested location
             if key in asdict(config.model):
                 config_dict["model"][key] = value

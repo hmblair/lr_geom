@@ -95,6 +95,10 @@ def build_model_from_config(
         radial_weight_rank=config.radial_weight_rank,
     ).to(device)
 
+    # Apply torch.compile for ~2x speedup (first forward pass will be slow)
+    if config.use_compile:
+        vae.compile()
+
     return embedding, vae
 
 
@@ -525,6 +529,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip_type", type=str, choices=["scaled", "gated", "none"])
     parser.add_argument("--rbf_type", type=str, choices=["gaussian", "bessel", "polynomial"])
     parser.add_argument("--radial_weight_rank", type=int, help="Rank for low-rank decomposition (None=full)")
+    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile (enabled by default)")
     parser.add_argument("--output_dir", type=str, help="Output directory")
     parser.add_argument("--data_dir", type=str, help="Data directory")
     parser.add_argument("--num_structures", type=int, help="Max structures to load")
