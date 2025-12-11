@@ -149,6 +149,7 @@ def load_structures(
                 "coord_scale": coord_scale.item(),
                 "atoms": polymer.atoms.long().to(device).clamp(min=0),
                 "id": polymer.id(),
+                "polymer": polymer,  # Keep for ciffy.rmsd
             })
 
             if config.num_structures and len(structures) >= config.num_structures:
@@ -183,12 +184,15 @@ def train_epoch(
     Returns:
         Dictionary of training metrics.
     """
+    import ciffy
+
     embedding.train()
     vae.train()
 
     total_loss = 0.0
     total_mse = 0.0
     total_kl = 0.0
+    total_rmsd = 0.0
     n_batches = 0
 
     # Shuffle structures
@@ -199,12 +203,14 @@ def train_epoch(
         s = structures[idx]
         coords = s["coords"]
         atoms = s["atoms"]
+        coord_scale = s["coord_scale"]
+        polymer = s["polymer"]
 
         # Forward pass
         features = embedding(atoms).unsqueeze(-1)
         recon, mu, logvar = vae(coords, features)
 
-        # Compute losses
+        # Compute losses (on normalized coordinates for training stability)
         coords_pred = recon[:, 0, :]
         mse_loss = ((coords_pred - coords) ** 2).mean()
         kl_loss = kl_divergence(mu, logvar).mean()
@@ -222,6 +228,13 @@ def train_epoch(
 
         optimizer.step()
 
+        # Compute aligned RMSD in Angstroms using ciffy
+        with torch.no_grad():
+            coords_pred_unnorm = coords_pred.detach().cpu() * coord_scale
+            pred_polymer = polymer.with_coordinates(coords_pred_unnorm)
+            rmsd = ciffy.rmsd(polymer, pred_polymer)
+            total_rmsd += rmsd
+
         total_loss += loss.item()
         total_mse += mse_loss.item()
         total_kl += kl_loss.item()
@@ -231,6 +244,7 @@ def train_epoch(
         "loss": total_loss / n_batches,
         "mse": total_mse / n_batches,
         "kl": total_kl / n_batches,
+        "rmsd": total_rmsd / n_batches,
     }
 
 
@@ -251,17 +265,22 @@ def evaluate(
     Returns:
         Dictionary of evaluation metrics.
     """
+    import ciffy
+
     embedding.eval()
     vae.eval()
 
     total_loss = 0.0
     total_mse = 0.0
     total_kl = 0.0
+    total_rmsd = 0.0
 
     with torch.no_grad():
         for s in structures:
             coords = s["coords"]
             atoms = s["atoms"]
+            coord_scale = s["coord_scale"]
+            polymer = s["polymer"]
 
             features = embedding(atoms).unsqueeze(-1)
             recon, mu, logvar = vae(coords, features)
@@ -271,15 +290,22 @@ def evaluate(
             kl_loss = kl_divergence(mu, logvar).mean()
             loss = mse_loss + config.kl_weight * kl_loss
 
+            # Compute aligned RMSD in Angstroms using ciffy
+            coords_pred_unnorm = coords_pred.cpu() * coord_scale
+            pred_polymer = polymer.with_coordinates(coords_pred_unnorm)
+            rmsd = ciffy.rmsd(polymer, pred_polymer)
+
             total_loss += loss.item()
             total_mse += mse_loss.item()
             total_kl += kl_loss.item()
+            total_rmsd += rmsd
 
     n = len(structures)
     return {
         "loss": total_loss / n,
         "mse": total_mse / n,
         "kl": total_kl / n,
+        "rmsd": total_rmsd / n,
     }
 
 
@@ -382,6 +408,7 @@ def run_experiment(config: ExperimentConfig) -> dict:
     # Training loop
     history = {"train": [], "val": []}
     best_val_loss = float("inf")
+    best_val_rmsd = float("inf")
     patience_counter = 0
 
     print("Training...")
@@ -397,8 +424,10 @@ def run_experiment(config: ExperimentConfig) -> dict:
             val_metrics = evaluate(embedding, vae, val_structures, config.training)
             history["val"].append(val_metrics)
             val_loss = val_metrics["loss"]
+            val_rmsd = val_metrics["rmsd"]
         else:
             val_loss = train_metrics["loss"]
+            val_rmsd = train_metrics["rmsd"]
 
         # Learning rate scheduling
         if scheduler is not None:
@@ -410,6 +439,7 @@ def run_experiment(config: ExperimentConfig) -> dict:
         # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_val_rmsd = val_rmsd
             patience_counter = 0
             # Save best model
             torch.save({
@@ -417,6 +447,7 @@ def run_experiment(config: ExperimentConfig) -> dict:
                 "vae": vae.state_dict(),
                 "epoch": epoch,
                 "val_loss": val_loss,
+                "val_rmsd": val_rmsd,
             }, output_dir / "best_model.pt")
         else:
             patience_counter += 1
@@ -425,11 +456,10 @@ def run_experiment(config: ExperimentConfig) -> dict:
         lr = optimizer.param_groups[0]["lr"]
         log_str = (
             f"Epoch {epoch:3d} | "
-            f"Train Loss: {train_metrics['loss']:.4f} | "
-            f"Train MSE: {train_metrics['mse']:.4f} | "
+            f"Train RMSD: {train_metrics['rmsd']:.2f}Å | "
         )
         if val_structures:
-            log_str += f"Val Loss: {val_metrics['loss']:.4f} | "
+            log_str += f"Val RMSD: {val_metrics['rmsd']:.2f}Å | "
         log_str += f"LR: {lr:.2e}"
         print(log_str)
 
@@ -450,13 +480,14 @@ def run_experiment(config: ExperimentConfig) -> dict:
     results = {
         "best_epoch": checkpoint["epoch"],
         "best_val_loss": checkpoint["val_loss"],
+        "best_val_rmsd": checkpoint.get("val_rmsd"),
     }
 
     if test_structures:
         test_metrics = evaluate(embedding, vae, test_structures, config.training)
         results["test"] = test_metrics
+        print(f"Test RMSD: {test_metrics['rmsd']:.2f}Å")
         print(f"Test Loss: {test_metrics['loss']:.4f}")
-        print(f"Test MSE: {test_metrics['mse']:.4f}")
 
     # Save results
     results["history"] = history

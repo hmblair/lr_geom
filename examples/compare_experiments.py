@@ -1,7 +1,8 @@
 """Multi-GPU experiment comparison runner.
 
 This script runs multiple experiments in parallel across available GPUs
-and outputs a comparison of results.
+and outputs a comparison of results. Reports aligned RMSD in Angstroms
+using ciffy.rmsd (Kabsch superposition).
 
 Usage:
     python examples/compare_experiments.py \\
@@ -14,11 +15,10 @@ Usage:
         --data_dir /path/to/structures \\
         --gpus 0,1,2,3
 
-Runs 4 experiments in parallel:
+Runs 3 experiments in parallel:
 - k=16, full_rank
-- k=16, rank=16
 - k=64, full_rank
-- k=64, rank=16
+- k=128, full_rank
 """
 from __future__ import annotations
 
@@ -36,9 +36,8 @@ import torch
 # Experiment configurations to compare
 EXPERIMENT_GRID = [
     {"name": "k16_fullrank", "k_neighbors": 16, "radial_weight_rank": None},
-    {"name": "k16_rank16", "k_neighbors": 16, "radial_weight_rank": 16},
     {"name": "k64_fullrank", "k_neighbors": 64, "radial_weight_rank": None},
-    {"name": "k64_rank16", "k_neighbors": 64, "radial_weight_rank": 16},
+    {"name": "k128_fullrank", "k_neighbors": 128, "radial_weight_rank": None},
 ]
 
 
@@ -240,7 +239,8 @@ def compare_results(
                 "k": exp["k_neighbors"],
                 "rank": exp["radial_weight_rank"] or "full",
                 "best_val_loss": data.get("best_val_loss"),
-                "test_mse": data.get("test", {}).get("mse"),
+                "best_val_rmsd": data.get("best_val_rmsd"),
+                "test_rmsd": data.get("test", {}).get("rmsd"),
                 "test_loss": data.get("test", {}).get("loss"),
                 "best_epoch": data.get("best_epoch"),
             })
@@ -251,27 +251,27 @@ def compare_results(
         print("\nNo results to compare.")
         return
 
-    # Sort by validation loss (best first)
-    results.sort(key=lambda x: x.get("best_val_loss") or float("inf"))
+    # Sort by test RMSD (best first), fallback to val RMSD
+    results.sort(key=lambda x: x.get("test_rmsd") or x.get("best_val_rmsd") or float("inf"))
 
     # Print comparison table
     print()
     print("=" * 78)
-    print("EXPERIMENT COMPARISON")
+    print("EXPERIMENT COMPARISON (RMSD in Angstroms, aligned via Kabsch)")
     print("=" * 78)
     print(
         f"{'Name':<20} {'k':<6} {'Rank':<8} "
-        f"{'Val Loss':<12} {'Test MSE':<12} {'Epoch':<8}"
+        f"{'Val RMSD':<12} {'Test RMSD':<12} {'Epoch':<8}"
     )
     print("-" * 78)
 
     for r in results:
-        val_loss = f"{r['best_val_loss']:.6f}" if r.get("best_val_loss") else "N/A"
-        test_mse = f"{r['test_mse']:.6f}" if r.get("test_mse") else "N/A"
+        val_rmsd = f"{r['best_val_rmsd']:.2f}Å" if r.get("best_val_rmsd") else "N/A"
+        test_rmsd = f"{r['test_rmsd']:.2f}Å" if r.get("test_rmsd") else "N/A"
         epoch = str(r.get("best_epoch", "N/A"))
         print(
             f"{r['name']:<20} {r['k']:<6} {str(r['rank']):<8} "
-            f"{val_loss:<12} {test_mse:<12} {epoch:<8}"
+            f"{val_rmsd:<12} {test_rmsd:<12} {epoch:<8}"
         )
 
     print("=" * 78)
@@ -280,14 +280,16 @@ def compare_results(
     summary_file = output_path / "comparison_summary.txt"
     with open(summary_file, "w") as f:
         f.write(f"Experiment Comparison - {datetime.now().isoformat()}\n")
+        f.write("RMSD values are aligned (Kabsch) and in Angstroms\n")
         f.write("=" * 78 + "\n\n")
 
         for r in results:
             f.write(f"{r['name']}:\n")
             f.write(f"  k_neighbors: {r['k']}\n")
             f.write(f"  radial_weight_rank: {r['rank']}\n")
+            f.write(f"  best_val_rmsd: {r.get('best_val_rmsd')}\n")
+            f.write(f"  test_rmsd: {r.get('test_rmsd')}\n")
             f.write(f"  best_val_loss: {r.get('best_val_loss')}\n")
-            f.write(f"  test_mse: {r.get('test_mse')}\n")
             f.write(f"  test_loss: {r.get('test_loss')}\n")
             f.write(f"  best_epoch: {r.get('best_epoch')}\n")
             f.write("\n")
