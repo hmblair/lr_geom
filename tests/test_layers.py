@@ -854,3 +854,269 @@ class TestDeviceAndDtype:
 
         output = layer(x)
         assert output.device.type == 'cuda'
+
+
+# ============================================================================
+# OUTPUT SCALE TESTS
+# ============================================================================
+
+class TestOutputScale:
+    """Verify layers don't explode or vanish output magnitudes."""
+
+    def test_equivariant_linear_scale(self, simple_repr):
+        """Output norm should be within reasonable bounds of input norm."""
+        layer = lg.EquivariantLinear(simple_repr, simple_repr)
+        x = torch.randn(100, simple_repr.mult, simple_repr.dim())
+        y = layer(x)
+
+        input_norm = x.norm()
+        output_norm = y.norm()
+        ratio = output_norm / input_norm
+
+        assert 0.1 < ratio < 10, f"Scale ratio {ratio:.3f} out of bounds [0.1, 10]"
+
+    def test_equivariant_gating_scale(self, simple_repr):
+        """Gating should not amplify output beyond input."""
+        layer = lg.EquivariantGating(simple_repr)
+        x = torch.randn(100, simple_repr.mult, simple_repr.dim())
+        y = layer(x)
+
+        # Gating uses sigmoid, so output should be dampened
+        assert y.norm() <= x.norm() * 2, "Gating should not amplify output significantly"
+
+    def test_equivariant_layernorm_scale(self, simple_repr):
+        """LayerNorm should produce reasonably bounded output."""
+        layer = lg.EquivariantLayerNorm(simple_repr)
+        x = torch.randn(100, simple_repr.mult, simple_repr.dim())
+        y = layer(x)
+
+        # LayerNorm output should have bounded variance
+        assert y.norm() / x.norm() < 10, "LayerNorm output scale too large"
+
+    def test_rbf_bounded_output(self):
+        """RBF outputs should be in [0, 1] range (Gaussian)."""
+        rbf = lg.RadialBasisFunctions(16, r_min=0.0, r_max=10.0)
+        x = torch.rand(100) * 10  # distances in [0, 10]
+        y = rbf(x)
+
+        assert y.min() >= 0, f"RBF outputs should be non-negative, got min={y.min():.4f}"
+        assert y.max() <= 1.1, f"RBF outputs should be bounded near 1, got max={y.max():.4f}"
+
+    @requires_sphericart
+    def test_transformer_output_scale(self, simple_repr, coordinates, k_neighbors):
+        """Transformer output should have reasonable scale."""
+        transformer = lg.EquivariantTransformer(
+            in_repr=simple_repr,
+            out_repr=simple_repr,
+            hidden_repr=simple_repr,
+            hidden_layers=2,
+            edge_dim=16,
+            edge_hidden_dim=32,
+            k_neighbors=k_neighbors,
+        )
+
+        x = torch.randn(coordinates.size(0), simple_repr.mult, simple_repr.dim())
+        y = transformer(coordinates, x)
+
+        input_norm = x.norm()
+        output_norm = y.norm()
+        ratio = output_norm / input_norm
+
+        assert 0.01 < ratio < 100, f"Transformer scale ratio {ratio:.3f} out of bounds"
+
+
+# ============================================================================
+# GRADIENT HEALTH TESTS
+# ============================================================================
+
+class TestGradientHealth:
+    """Verify gradient flow is healthy (not vanishing/exploding)."""
+
+    def test_gradient_magnitude_linear(self, simple_repr):
+        """Gradients should have reasonable magnitude."""
+        layer = lg.EquivariantLinear(simple_repr, simple_repr)
+        x = torch.randn(100, simple_repr.mult, simple_repr.dim(), requires_grad=True)
+        y = layer(x)
+        loss = y.sum()
+        loss.backward()
+
+        grad_norm = x.grad.norm()
+        assert grad_norm > 1e-6, f"Gradient too small: {grad_norm:.2e} (vanishing)"
+        assert grad_norm < 1e6, f"Gradient too large: {grad_norm:.2e} (exploding)"
+
+    def test_gradient_magnitude_gating(self, simple_repr):
+        """Gating gradients should flow properly."""
+        layer = lg.EquivariantGating(simple_repr)
+        x = torch.randn(100, simple_repr.mult, simple_repr.dim(), requires_grad=True)
+        y = layer(x)
+        loss = y.sum()
+        loss.backward()
+
+        grad_norm = x.grad.norm()
+        assert grad_norm > 1e-6, f"Gradient too small: {grad_norm:.2e}"
+        assert grad_norm < 1e6, f"Gradient too large: {grad_norm:.2e}"
+
+    def test_gradient_magnitude_layernorm(self, simple_repr):
+        """LayerNorm gradients should flow properly."""
+        layer = lg.EquivariantLayerNorm(simple_repr)
+        x = torch.randn(100, simple_repr.mult, simple_repr.dim(), requires_grad=True)
+        y = layer(x)
+        loss = y.sum()
+        loss.backward()
+
+        grad_norm = x.grad.norm()
+        assert grad_norm > 1e-6, f"Gradient too small: {grad_norm:.2e}"
+        assert grad_norm < 1e6, f"Gradient too large: {grad_norm:.2e}"
+
+    @requires_sphericart
+    def test_deep_transformer_gradient(self, simple_repr, coordinates, k_neighbors):
+        """Gradients should flow through deep transformer without vanishing."""
+        transformer = lg.EquivariantTransformer(
+            in_repr=simple_repr,
+            out_repr=simple_repr,
+            hidden_repr=simple_repr,
+            hidden_layers=8,  # Deep network
+            edge_dim=16,
+            edge_hidden_dim=32,
+            k_neighbors=k_neighbors,
+        )
+
+        x = torch.randn(coordinates.size(0), simple_repr.mult, simple_repr.dim(), requires_grad=True)
+        y = transformer(coordinates, x)
+        loss = y.sum()
+        loss.backward()
+
+        grad_norm = x.grad.norm()
+        assert grad_norm > 1e-8, f"Gradient vanishing in deep transformer: {grad_norm:.2e}"
+        assert grad_norm < 1e8, f"Gradient exploding in deep transformer: {grad_norm:.2e}"
+
+
+# ============================================================================
+# ATTENTION CORRECTNESS TESTS
+# ============================================================================
+
+class TestAttentionCorrectness:
+    """Verify attention mechanism behaves correctly."""
+
+    def test_attention_output_shape(self, k_neighbors):
+        """Attention should produce correct output shape."""
+        hidden_size = 64
+        nheads = 4
+        N = 50
+
+        layer = lg.Attention(hidden_size, nheads)
+        queries = torch.randn(N, hidden_size)
+        keys = torch.randn(N, hidden_size)
+        values = torch.randn(N, hidden_size)
+        # Create neighbor indices (N, k)
+        neighbor_idx = torch.randint(0, N, (N, k_neighbors))
+
+        output = layer(keys, queries, values, neighbor_idx)
+        assert output.shape == (N, hidden_size)
+
+    def test_masked_attention_ignores_masked(self, k_neighbors):
+        """Masked positions should not contribute to output."""
+        hidden_size = 64
+        nheads = 4
+        N = 10
+
+        layer = lg.Attention(hidden_size, nheads)
+        queries = torch.randn(N, hidden_size)
+        keys = torch.randn(N, hidden_size)
+        values = torch.randn(N, hidden_size)
+        neighbor_idx = torch.randint(0, N, (N, k_neighbors))
+
+        # Create mask that masks out all but first neighbor
+        mask = torch.ones(N, k_neighbors, dtype=torch.bool)
+        mask[:, 0] = False  # Only first neighbor is unmasked
+
+        output_masked = layer(keys, queries, values, neighbor_idx, mask=mask)
+
+        # Run again with same inputs - should be deterministic in eval mode
+        layer.eval()
+        output_again = layer(keys, queries, values, neighbor_idx, mask=mask)
+
+        # Outputs should be the same
+        assert torch.allclose(output_masked, output_again, rtol=1e-4, atol=1e-5)
+
+    def test_attention_deterministic_eval(self, k_neighbors):
+        """Attention in eval mode should be deterministic."""
+        hidden_size = 64
+        nheads = 4
+        N = 50
+
+        layer = lg.Attention(hidden_size, nheads, dropout=0.5)
+        layer.eval()
+
+        queries = torch.randn(N, hidden_size)
+        keys = torch.randn(N, hidden_size)
+        values = torch.randn(N, hidden_size)
+        neighbor_idx = torch.randint(0, N, (N, k_neighbors))
+
+        output1 = layer(keys, queries, values, neighbor_idx)
+        output2 = layer(keys, queries, values, neighbor_idx)
+
+        assert torch.allclose(output1, output2), "Eval mode should be deterministic"
+
+
+# ============================================================================
+# NORMALIZATION PROPERTY TESTS
+# ============================================================================
+
+class TestNormalizationProperties:
+    """Verify normalization layers work correctly."""
+
+    def test_layernorm_stabilizes_scale(self, simple_repr):
+        """LayerNorm should stabilize output scale regardless of input scale."""
+        ln = lg.EquivariantLayerNorm(simple_repr)
+
+        # Test with small input
+        x_small = torch.randn(100, simple_repr.mult, simple_repr.dim()) * 0.01
+        y_small = ln(x_small)
+
+        # Test with large input
+        x_large = torch.randn(100, simple_repr.mult, simple_repr.dim()) * 100
+        y_large = ln(x_large)
+
+        # Output norms should be much closer than input norms
+        input_ratio = x_large.norm() / x_small.norm()
+        output_ratio = y_large.norm() / y_small.norm()
+
+        # LayerNorm should reduce the ratio significantly (input ratio ~10000, output should be <100)
+        assert output_ratio < input_ratio / 10, (
+            f"LayerNorm should stabilize scale. Input ratio: {input_ratio:.1f}, "
+            f"Output ratio: {output_ratio:.1f}"
+        )
+
+    def test_layernorm_preserves_equivariance_after_scaling(self, simple_repr, rotation_params):
+        """LayerNorm should be equivariant regardless of input scale."""
+        axis, angle = rotation_params
+        ln = lg.EquivariantLayerNorm(simple_repr)
+
+        # Large input
+        x = torch.randn(50, simple_repr.mult, simple_repr.dim()) * 100
+
+        # Get Wigner D-matrix
+        D = get_wigner_d_matrix(simple_repr, axis, angle)
+
+        # Rotate then normalize
+        x_rotated = x @ D.T
+        y_rotated = ln(x_rotated)
+
+        # Normalize then rotate
+        y = ln(x)
+        y_then_rotated = y @ D.T
+
+        assert torch.allclose(y_rotated, y_then_rotated, rtol=RTOL, atol=ATOL), (
+            f"LayerNorm should be equivariant. Max diff: {(y_rotated - y_then_rotated).abs().max():.6f}"
+        )
+
+    def test_layernorm_handles_near_zero_input(self, simple_repr):
+        """LayerNorm should handle near-zero inputs without NaN."""
+        ln = lg.EquivariantLayerNorm(simple_repr)
+
+        x = torch.randn(50, simple_repr.mult, simple_repr.dim()) * 1e-8
+        y = ln(x)
+
+        assert not torch.isnan(y).any(), "LayerNorm produced NaN for near-zero input"
+        assert not torch.isinf(y).any(), "LayerNorm produced Inf for near-zero input"

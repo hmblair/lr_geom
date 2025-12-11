@@ -215,7 +215,7 @@ class EquivariantLinear(nn.Module):
 
         if nscalar > 0 and bias:
             self.bias = nn.Parameter(
-                torch.randn(out_repr.mult, nscalar),
+                torch.zeros(out_repr.mult, nscalar),
                 requires_grad=True,
             )
         else:
@@ -239,6 +239,7 @@ class EquivariantLinear(nn.Module):
 
         # Apply linear transformation
         out = (self.weight @ f).view(*b, *self.outdims)
+        out = self.dropout(out)
 
         # Gather components for each degree
         ix = self.indices.expand(*b, *self.expanddims)
@@ -731,6 +732,8 @@ class EquivariantTransformerBlock(nn.Module):
         dropout: Dropout probability.
         attn_dropout: Attention dropout probability.
         transition: Whether to include transition layer.
+        residual_scale: Scale factor for residual connections. Use < 1.0
+            (e.g., 0.1-0.5) for deep networks to improve gradient flow.
     """
 
     def __init__(
@@ -742,10 +745,12 @@ class EquivariantTransformerBlock(nn.Module):
         dropout: float = 0.0,
         attn_dropout: float = 0.0,
         transition: bool = False,
+        residual_scale: float = 1.0,
     ) -> None:
         super().__init__()
 
         self.prepr = repr
+        self.residual_scale = residual_scale
 
         self.attn = EquivariantAttention(
             repr, edge_dim, edge_hidden_dim, nheads, dropout, attn_dropout
@@ -796,7 +801,7 @@ class EquivariantTransformerBlock(nn.Module):
         features = self.attn(basis, edge_feats, features, neighbor_idx, mask)
 
         if self.skip:
-            features = features + features_tmp
+            features = features + self.residual_scale * features_tmp
 
         if self.transition is not None:
             if self.skip:
@@ -804,7 +809,7 @@ class EquivariantTransformerBlock(nn.Module):
             features = self.ln2(features)
             features = self.transition(features)
             if self.skip:
-                features = features + features_tmp
+                features = features + self.residual_scale * features_tmp
 
         return features
 
@@ -828,6 +833,8 @@ class EquivariantTransformer(nn.Module):
         dropout: Dropout probability.
         attn_dropout: Attention dropout probability.
         transition: Whether to include transition layers.
+        residual_scale: Scale factor for residual connections. Use < 1.0
+            (e.g., 0.1-0.5) for deep networks to improve gradient flow.
 
     Example:
         >>> in_repr = Repr(lvals=[0, 1], mult=4)
@@ -856,6 +863,7 @@ class EquivariantTransformer(nn.Module):
         dropout: float = 0.0,
         attn_dropout: float = 0.0,
         transition: bool = False,
+        residual_scale: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -865,6 +873,7 @@ class EquivariantTransformer(nn.Module):
         self.dropout = dropout
         self.attn_dropout = attn_dropout
         self.use_transition = transition
+        self.residual_scale = residual_scale
         self.k_neighbors = k_neighbors
 
         self.in_repr = in_repr
@@ -910,6 +919,7 @@ class EquivariantTransformer(nn.Module):
             self.dropout,
             self.attn_dropout,
             self.use_transition,
+            self.residual_scale,
         )
 
     def forward(

@@ -168,6 +168,8 @@ class EquivariantVAE(nn.Module):
         nheads: Number of attention heads. Defaults to 4.
         dropout: Dropout probability. Defaults to 0.0.
         var_hidden_dim: Hidden dimension for variational head MLP. Defaults to 64.
+        residual_scale: Scale factor for residual connections. Use < 1.0
+            (e.g., 0.1-0.5) for deep networks to improve gradient flow.
 
     Example:
         >>> in_repr = Repr([0, 1], mult=8)
@@ -202,6 +204,7 @@ class EquivariantVAE(nn.Module):
         nheads: int = 4,
         dropout: float = 0.0,
         var_hidden_dim: int = 64,
+        residual_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.in_repr = in_repr
@@ -220,6 +223,7 @@ class EquivariantVAE(nn.Module):
             edge_hidden_dim=edge_hidden_dim,
             nheads=nheads,
             dropout=dropout,
+            residual_scale=residual_scale,
         )
 
         # Variational head
@@ -238,6 +242,7 @@ class EquivariantVAE(nn.Module):
             edge_hidden_dim=edge_hidden_dim,
             nheads=nheads,
             dropout=dropout,
+            residual_scale=residual_scale,
         )
 
     def encode(

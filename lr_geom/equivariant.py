@@ -189,26 +189,37 @@ class RadialBasisFunctions(nn.Module):
 
     Args:
         num_functions: Number of basis functions.
+        r_min: Minimum distance for center initialization.
+        r_max: Maximum distance for center initialization.
 
     Attributes:
-        mu: Learnable centers of the Gaussians.
-        sigma: Learnable widths of the Gaussians.
+        mu: Learnable centers of the Gaussians, initialized evenly spaced.
+        sigma: Learnable widths of the Gaussians, initialized based on spacing.
 
     Example:
-        >>> rbf = RadialBasisFunctions(16)
-        >>> distances = torch.randn(100)
+        >>> rbf = RadialBasisFunctions(16, r_min=0.0, r_max=10.0)
+        >>> distances = torch.rand(100) * 10  # distances in [0, 10]
         >>> features = rbf(distances)  # shape: (100, 16)
     """
 
-    def __init__(self: RadialBasisFunctions, num_functions: int) -> None:
+    def __init__(
+        self: RadialBasisFunctions,
+        num_functions: int,
+        r_min: float = 0.0,
+        r_max: float = 10.0,
+    ) -> None:
         super().__init__()
 
+        # Initialize centers evenly spaced in [r_min, r_max]
         self.mu = nn.Parameter(
-            torch.randn(num_functions),
+            torch.linspace(r_min, r_max, num_functions),
             requires_grad=True,
         )
+
+        # Initialize widths based on spacing between centers
+        spacing = (r_max - r_min) / max(num_functions - 1, 1)
         self.sigma = nn.Parameter(
-            torch.randn(num_functions),
+            torch.full((num_functions,), spacing),
             requires_grad=True,
         )
 
@@ -221,10 +232,9 @@ class RadialBasisFunctions(nn.Module):
         Returns:
             Basis function values of shape (..., num_functions).
         """
-        # Compute the scaled distance from each center
-        exp = (x[..., None] - self.mu) * self.sigma ** 2
-        # Return Gaussian values scaled by |sigma|
-        return torch.exp(-exp ** 2) * self.sigma.abs()
+        # Standard Gaussian RBF: exp(-((x - mu) / sigma)^2)
+        diff = (x[..., None] - self.mu) / self.sigma.abs().clamp(min=1e-6)
+        return torch.exp(-diff ** 2)
 
 
 class EquivariantBasis(nn.Module):
