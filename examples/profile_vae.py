@@ -297,9 +297,11 @@ class LayerProfiler:
 
     def profile_equivariant_transition(self) -> ProfileResult:
         """Profile EquivariantTransition."""
+        # Create expanded hidden repr (typically 4x mult)
+        expanded_repr = Repr(self.hidden_repr.lvals, mult=self.hidden_repr.mult * 4)
         transition = EquivariantTransition(
             self.hidden_repr,
-            expansion_factor=2,
+            expanded_repr,
         ).to(self.device)
 
         return self._profile_forward(
