@@ -140,7 +140,11 @@ def diagnose():
         hooks.append(layer.ln1.register_forward_hook(make_hook(f"enc.layer{i}.ln1")))
         # Detailed attention hooks
         hooks.append(layer.attn.proj_q.register_forward_hook(make_hook(f"enc.layer{i}.attn.proj_q")))
+        # Trace inside conv_k
+        hooks.append(layer.attn.conv_k.rwlin.register_forward_hook(make_hook(f"enc.layer{i}.attn.conv_k.rwlin")))
         hooks.append(layer.attn.conv_k.register_forward_hook(make_hook(f"enc.layer{i}.attn.conv_k")))
+        # Trace inside conv_v
+        hooks.append(layer.attn.conv_v.rwlin.register_forward_hook(make_hook(f"enc.layer{i}.attn.conv_v.rwlin")))
         hooks.append(layer.attn.conv_v.register_forward_hook(make_hook(f"enc.layer{i}.attn.conv_v")))
         hooks.append(layer.attn.out_proj.register_forward_hook(make_hook(f"enc.layer{i}.attn.out_proj")))
         hooks.append(layer.attn.register_forward_hook(make_hook(f"enc.layer{i}.attn")))
@@ -175,6 +179,22 @@ def diagnose():
 
         print("\n2. VAE FORWARD")
         recon, mu, logvar = vae(coords, features)
+
+        # Also check basis matrices
+        print("\n2b. BASIS MATRIX STATS")
+        enc = vae.encoder
+        neighbor_idx = lg.build_knn_graph(coords, enc.k_neighbors)
+        N, k = neighbor_idx.shape
+        displacements = coords.unsqueeze(1) - coords[neighbor_idx]
+        all_bases = enc.bases(displacements.view(N * k, 3))
+        basis_k = all_bases[0]  # First layer K basis
+        basis_v = all_bases[1]  # First layer V basis
+        b1_k, b2_k = basis_k
+        b1_v, b2_v = basis_v
+        print_stats("basis_k[0] (b1)", b1_k)
+        print_stats("basis_k[1] (b2)", b2_k)
+        print_stats("basis_v[0] (b1)", b1_v)
+        print_stats("basis_v[1] (b2)", b2_v)
 
         # Print all captured activations
         print("\n3. CAPTURED ACTIVATIONS")
