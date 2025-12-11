@@ -298,7 +298,7 @@ class LayerProfiler:
     def profile_equivariant_transition(self) -> ProfileResult:
         """Profile EquivariantTransition."""
         # Create expanded hidden repr (typically 4x mult)
-        expanded_repr = Repr(self.hidden_repr.lvals, mult=self.hidden_repr.mult * 4)
+        expanded_repr = lg.Repr(self.hidden_repr.lvals, mult=self.hidden_repr.mult * 4)
         transition = EquivariantTransition(
             self.hidden_repr,
             expanded_repr,
