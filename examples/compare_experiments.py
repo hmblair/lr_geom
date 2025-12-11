@@ -15,10 +15,10 @@ Usage:
         --data_dir /path/to/structures \\
         --gpus 0,1,2,3
 
-Runs 6 experiments in parallel:
-- k=16, full_rank and rank=16
-- k=64, full_rank and rank=16
-- k=128, full_rank and rank=16
+Runs 12 experiments in parallel:
+- Node-wise vs Edge-wise attention
+- k=16, 64, 128
+- Full rank vs rank=16
 """
 from __future__ import annotations
 
@@ -35,12 +35,20 @@ import torch
 
 # Experiment configurations to compare
 EXPERIMENT_GRID = [
-    {"name": "k16_fullrank", "k_neighbors": 16, "radial_weight_rank": None},
-    {"name": "k16_rank16", "k_neighbors": 16, "radial_weight_rank": 16},
-    {"name": "k64_fullrank", "k_neighbors": 64, "radial_weight_rank": None},
-    {"name": "k64_rank16", "k_neighbors": 64, "radial_weight_rank": 16},
-    {"name": "k128_fullrank", "k_neighbors": 128, "radial_weight_rank": None},
-    {"name": "k128_rank16", "k_neighbors": 128, "radial_weight_rank": 16},
+    # Node-wise attention (Q at node, K/V at edge)
+    {"name": "node_k16_fullrank", "k_neighbors": 16, "radial_weight_rank": None, "attention_type": "node_wise"},
+    {"name": "node_k16_rank16", "k_neighbors": 16, "radial_weight_rank": 16, "attention_type": "node_wise"},
+    {"name": "node_k64_fullrank", "k_neighbors": 64, "radial_weight_rank": None, "attention_type": "node_wise"},
+    {"name": "node_k64_rank16", "k_neighbors": 64, "radial_weight_rank": 16, "attention_type": "node_wise"},
+    {"name": "node_k128_fullrank", "k_neighbors": 128, "radial_weight_rank": None, "attention_type": "node_wise"},
+    {"name": "node_k128_rank16", "k_neighbors": 128, "radial_weight_rank": 16, "attention_type": "node_wise"},
+    # Edge-wise attention (Q/K/V all at edge)
+    {"name": "edge_k16_fullrank", "k_neighbors": 16, "radial_weight_rank": None, "attention_type": "edge_wise"},
+    {"name": "edge_k16_rank16", "k_neighbors": 16, "radial_weight_rank": 16, "attention_type": "edge_wise"},
+    {"name": "edge_k64_fullrank", "k_neighbors": 64, "radial_weight_rank": None, "attention_type": "edge_wise"},
+    {"name": "edge_k64_rank16", "k_neighbors": 64, "radial_weight_rank": 16, "attention_type": "edge_wise"},
+    {"name": "edge_k128_fullrank", "k_neighbors": 128, "radial_weight_rank": None, "attention_type": "edge_wise"},
+    {"name": "edge_k128_rank16", "k_neighbors": 128, "radial_weight_rank": 16, "attention_type": "edge_wise"},
 ]
 
 
@@ -90,6 +98,10 @@ def run_single_experiment(
     # Add radial_weight_rank if specified
     if exp_config["radial_weight_rank"] is not None:
         cmd.extend(["--radial_weight_rank", str(exp_config["radial_weight_rank"])])
+
+    # Add attention_type if specified
+    if exp_config.get("attention_type"):
+        cmd.extend(["--attention_type", exp_config["attention_type"]])
 
     # Add extra arguments
     cmd.extend(extra_args)
@@ -239,6 +251,7 @@ def compare_results(
             data = torch.load(results_file, map_location="cpu")
             results.append({
                 "name": exp["name"],
+                "attn": exp.get("attention_type", "node")[:4],  # "node" or "edge"
                 "k": exp["k_neighbors"],
                 "rank": exp["radial_weight_rank"] or "full",
                 "best_val_loss": data.get("best_val_loss"),
@@ -260,14 +273,14 @@ def compare_results(
 
     # Print comparison table
     print()
-    print("=" * 90)
+    print("=" * 100)
     print("EXPERIMENT COMPARISON (RMSD in Angstroms, aligned via Kabsch)")
-    print("=" * 90)
+    print("=" * 100)
     print(
-        f"{'Name':<20} {'k':<6} {'Rank':<8} "
-        f"{'Val RMSD':<12} {'Test RMSD':<12} {'Epoch':<8} {'Time/Ep':<10}"
+        f"{'Name':<22} {'Attn':<6} {'k':<5} {'Rank':<6} "
+        f"{'Val RMSD':<10} {'Test RMSD':<10} {'Epoch':<7} {'Time/Ep':<8}"
     )
-    print("-" * 90)
+    print("-" * 100)
 
     for r in results:
         val_rmsd = f"{r['best_val_rmsd']:.2f}Å" if r.get("best_val_rmsd") else "N/A"
@@ -275,11 +288,11 @@ def compare_results(
         epoch = str(r.get("best_epoch", "N/A"))
         epoch_time = f"{r['avg_epoch_time']:.1f}s" if r.get("avg_epoch_time") else "N/A"
         print(
-            f"{r['name']:<20} {r['k']:<6} {str(r['rank']):<8} "
-            f"{val_rmsd:<12} {test_rmsd:<12} {epoch:<8} {epoch_time:<10}"
+            f"{r['name']:<22} {r['attn']:<6} {r['k']:<5} {str(r['rank']):<6} "
+            f"{val_rmsd:<10} {test_rmsd:<10} {epoch:<7} {epoch_time:<8}"
         )
 
-    print("=" * 90)
+    print("=" * 100)
 
     # Save summary to file
     summary_file = output_path / "comparison_summary.txt"
@@ -290,6 +303,7 @@ def compare_results(
 
         for r in results:
             f.write(f"{r['name']}:\n")
+            f.write(f"  attention_type: {r['attn']}\n")
             f.write(f"  k_neighbors: {r['k']}\n")
             f.write(f"  radial_weight_rank: {r['rank']}\n")
             f.write(f"  best_val_rmsd: {r.get('best_val_rmsd')}\n")
