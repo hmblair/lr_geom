@@ -217,9 +217,9 @@ class LayerProfiler:
     def profile_equivariant_basis(self) -> ProfileResult:
         """Profile EquivariantBasis."""
         prod_repr = lg.ProductRepr(self.hidden_repr, self.hidden_repr)
-        basis = EquivariantBasis(prod_repr, lmax=2).to(self.device)
+        basis = EquivariantBasis(prod_repr).to(self.device)
 
-        # Need spherical harmonics
+        # Need unit displacement vectors
         unit_vecs = self.displacements / (self.distances.unsqueeze(-1) + 1e-8)
 
         return self._profile_forward(
@@ -344,7 +344,7 @@ class LayerProfiler:
         ).to(self.device)
 
         # Create basis and edge features
-        basis_mod = EquivariantBasis(prod_repr, lmax=2).to(self.device)
+        basis_mod = EquivariantBasis(prod_repr).to(self.device)
         rbf = RadialBasisFunctions(edge_dim).to(self.device)
 
         unit_vecs = self.displacements / (self.distances.unsqueeze(-1) + 1e-8)
@@ -374,7 +374,7 @@ class LayerProfiler:
         ).to(self.device)
 
         # Create basis and edge features
-        basis_mod = EquivariantBasis(prod_repr, lmax=2).to(self.device)
+        basis_mod = EquivariantBasis(prod_repr).to(self.device)
         rbf = RadialBasisFunctions(edge_dim).to(self.device)
 
         unit_vecs = self.displacements / (self.distances.unsqueeze(-1) + 1e-8)
@@ -404,7 +404,7 @@ class LayerProfiler:
         ).to(self.device)
 
         # Create basis and edge features
-        basis_mod = EquivariantBasis(prod_repr, lmax=2).to(self.device)
+        basis_mod = EquivariantBasis(prod_repr).to(self.device)
         rbf = RadialBasisFunctions(edge_dim).to(self.device)
 
         unit_vecs = self.displacements / (self.distances.unsqueeze(-1) + 1e-8)
