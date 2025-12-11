@@ -678,10 +678,6 @@ class EquivariantAttention(nn.Module):
         # No bias - attention should preserve zero-mean property, bias causes gradient explosion
         self.out_proj = EquivariantLinear(repr.rep2, repr.rep2, activation=None, bias=False)
 
-        # Learnable output scale (ReZero-style) - starts small to stabilize early training
-        # This helps balance gradients between V (direct path) and Q/K (dampened by softmax)
-        self.output_scale = nn.Parameter(torch.tensor(0.1))
-
         self.attn_dropout = nn.Dropout(attn_dropout)
 
     def forward(
@@ -773,7 +769,7 @@ class EquivariantAttention(nn.Module):
         # Reshape back to (N, out_mult, out_dim)
         output = output.view(N, self.out_mult, self.out_dim)
 
-        return self.output_scale * self.out_proj(output)
+        return self.out_proj(output)
 
 
 class EquivariantTransformerBlock(nn.Module):
