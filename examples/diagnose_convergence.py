@@ -388,7 +388,12 @@ def diagnose():
             recon, mu, logvar = model(s["coords"], s["atoms"])
             coords_pred = recon[:, 0, :]
 
-            recon_loss = ((coords_pred - s["coords"]) ** 2).mean()
+            # Use Kabsch-aligned RMSD loss (proper for equivariant models)
+            # Denormalize to original scale for ciffy
+            coords_pred_angstrom = coords_pred * s["coord_scale"]
+            pred_polymer = s["polymer"].with_coordinates(coords_pred_angstrom)
+            recon_loss = ciffy.rmsd(s["polymer"], pred_polymer, ciffy.MOLECULE)
+
             kl_loss = kl_divergence(mu, logvar)
             loss = recon_loss + 0.001 * kl_loss  # Very small KL weight
 
