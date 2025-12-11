@@ -72,7 +72,8 @@ class RepNorm(nn.Module):
     def forward(self: RepNorm, st: torch.Tensor) -> torch.Tensor:
         """Compute the norm of each irrep component.
 
-        Uses torch.split + stack for torch.compile compatibility.
+        Uses torch.split + explicit squared sum for torch.compile compatibility.
+        Note: .norm(dim=-1) has FakeTensor shape inference issues with compile.
 
         Args:
             st: Spherical tensor of shape (..., dim).
@@ -82,9 +83,10 @@ class RepNorm(nn.Module):
         """
         # Split along last dimension into irrep components
         components = torch.split(st, self.split_sizes, dim=-1)
-        # Compute norm of each component and stack
-        norms = torch.stack([c.norm(dim=-1) for c in components], dim=-1)
-        return norms
+        # Compute squared norm of each component (explicit multiply avoids .norm() compile issues)
+        sq_norms = [(c * c).sum(dim=-1) for c in components]
+        # Stack and take sqrt
+        return torch.stack(sq_norms, dim=-1).sqrt()
 
 
 class SphericalHarmonic(nn.Module):
