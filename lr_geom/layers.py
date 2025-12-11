@@ -524,7 +524,7 @@ class EquivariantLayerNorm(nn.Module):
         Returns:
             Normalized tensor of shape (..., mult, dim).
         """
-        # Compute norms
+        # Compute norms: shape (..., mult, nreps)
         norms = self.norm(f)
 
         # For mult=1, just normalize by the norm (no cross-channel normalization)
@@ -532,10 +532,11 @@ class EquivariantLayerNorm(nn.Module):
             norms_r = 1.0 / (norms + self.epsilon)
             return f * norms_r[..., self.ix]
 
-        *b, h, d = norms.size()
-
-        # Apply LayerNorm across multiplicity
-        lnorms = self.lnorm(norms.view(-1, d, h)).view(*b, h, d)
+        # LayerNorm expects mult as the last dimension
+        # norms has shape (..., mult, nreps), need to transpose for LayerNorm
+        norms_t = norms.transpose(-2, -1)  # (..., nreps, mult)
+        lnorms_t = self.lnorm(norms_t)  # normalize over mult (last dim)
+        lnorms = lnorms_t.transpose(-2, -1)  # (..., mult, nreps)
 
         # Renormalize features
         norms_r = lnorms / (norms + self.epsilon)

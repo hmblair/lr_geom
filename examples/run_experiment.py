@@ -309,11 +309,76 @@ def evaluate(
     }
 
 
-def run_experiment(config: ExperimentConfig) -> dict:
+def save_reconstructions(
+    embedding: nn.Embedding,
+    vae: EquivariantVAE,
+    structures: list[dict],
+    output_dir: Path,
+    num_samples: int = 3,
+) -> list[str]:
+    """Save original and reconstructed structures as .cif files.
+
+    Args:
+        embedding: Atom embedding module.
+        vae: VAE model.
+        structures: List of structure data.
+        output_dir: Directory to save .cif files.
+        num_samples: Number of samples to save.
+
+    Returns:
+        List of saved structure IDs.
+    """
+    embedding.eval()
+    vae.eval()
+
+    recon_dir = output_dir / "reconstructions"
+    recon_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_ids = []
+    n_to_save = min(num_samples, len(structures))
+
+    with torch.no_grad():
+        for i in range(n_to_save):
+            s = structures[i]
+            coords = s["coords"]
+            atoms = s["atoms"]
+            coord_scale = s["coord_scale"]
+            polymer = s["polymer"]
+            struct_id = s["id"]
+
+            # Forward pass
+            features = embedding(atoms).unsqueeze(-1)
+            recon, _, _ = vae(coords, features)
+
+            # Get predicted coordinates (unnormalized)
+            coords_pred = recon[:, 0, :]
+            coords_pred_unnorm = coords_pred * coord_scale
+
+            # Create reconstructed polymer
+            pred_polymer = polymer.with_coordinates(coords_pred_unnorm)
+
+            # Save original and reconstructed structures
+            safe_id = struct_id.replace("/", "_").replace(" ", "_")
+            original_path = recon_dir / f"{safe_id}_original.cif"
+            recon_path = recon_dir / f"{safe_id}_reconstructed.cif"
+
+            try:
+                polymer.write(str(original_path))
+                pred_polymer.write(str(recon_path))
+                saved_ids.append(struct_id)
+                print(f"  Saved reconstruction for {struct_id}")
+            except Exception as e:
+                print(f"  Warning: Could not save {struct_id}: {e}")
+
+    return saved_ids
+
+
+def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3) -> dict:
     """Run a single experiment.
 
     Args:
         config: Experiment configuration.
+        num_recon_samples: Number of test samples to save reconstructions for.
 
     Returns:
         Dictionary of results.
@@ -495,6 +560,16 @@ def run_experiment(config: ExperimentConfig) -> dict:
         print(f"Test Loss: {test_metrics['loss']:.4f}")
         print(f"Avg epoch time: {avg_epoch_time:.1f}s")
 
+        # Save reconstructions for visual inspection
+        print()
+        print("Saving reconstructions...")
+        saved_ids = save_reconstructions(
+            embedding, vae, test_structures, output_dir, num_samples=num_recon_samples
+        )
+        if saved_ids:
+            results["reconstruction_ids"] = saved_ids
+            print(f"Saved {len(saved_ids)} reconstructions to: {output_dir / 'reconstructions'}")
+
     # Save results
     results["history"] = history
     torch.save(results, output_dir / "results.pt")
@@ -535,6 +610,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_structures", type=int, help="Max structures to load")
     parser.add_argument("--device", type=str, help="Device (cuda, cpu, auto)")
     parser.add_argument("--seed", type=int, help="Random seed")
+    parser.add_argument("--num_recon_samples", type=int, default=3, help="Number of test samples to save reconstructions for")
 
     return parser.parse_args()
 
@@ -551,7 +627,7 @@ def main():
     config = merge_config_with_args(config, args)
 
     # Run experiment
-    run_experiment(config)
+    run_experiment(config, num_recon_samples=args.num_recon_samples)
 
 
 if __name__ == "__main__":

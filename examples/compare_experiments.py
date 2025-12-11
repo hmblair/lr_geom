@@ -356,6 +356,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum number of structures to load",
     )
+    parser.add_argument(
+        "--num_recon_samples",
+        type=int,
+        default=3,
+        help="Number of test samples to save reconstructions for (default: 3)",
+    )
 
     return parser.parse_args()
 
@@ -389,6 +395,7 @@ def main():
     extra_args = ["--epochs", str(args.epochs), "--data_dir", args.data_dir]
     if args.num_structures:
         extra_args.extend(["--num_structures", str(args.num_structures)])
+    extra_args.extend(["--num_recon_samples", str(args.num_recon_samples)])
 
     # Verify base config exists
     if not Path(args.config).exists():
