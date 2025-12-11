@@ -15,6 +15,7 @@ Modules:
     equivariant: Equivariant primitives (spherical harmonics, basis functions)
     layers: Equivariant neural network layers (convolution, attention)
     models: Pre-built geometric models
+    vae: SO(3)-equivariant variational autoencoder
 
 Optional Dependencies:
     - sphericart: Required for SphericalHarmonic
@@ -65,6 +66,14 @@ from .equivariant import (
 # Models
 from .models import GNMA
 
+# VAE
+from .vae import (
+    EquivariantVAE,
+    VariationalHead,
+    reparameterize,
+    kl_divergence,
+)
+
 # Equivariant layers
 from .layers import (
     build_knn_graph,
@@ -107,6 +116,11 @@ __all__ = [
     "EquivariantBases",
     # Models
     "GNMA",
+    # VAE
+    "EquivariantVAE",
+    "VariationalHead",
+    "reparameterize",
+    "kl_divergence",
     # Layers
     "build_knn_graph",
     "RadialWeight",

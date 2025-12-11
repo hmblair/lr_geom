@@ -7,9 +7,8 @@ A PyTorch library for SO(3)-equivariant neural networks using low-rank tensor pr
 ```bash
 pip install -e .
 
-# With optional dependencies
-pip install -e ".[spherical]"  # Spherical harmonics (sphericart)
-pip install -e ".[graphs]"     # Graph layers (DGL)
+# With optional spherical harmonics support
+pip install -e ".[spherical]"  # Requires sphericart
 pip install -e ".[all]"        # All optional dependencies
 ```
 
@@ -183,50 +182,37 @@ messages = conv(
 )  # (500, 16, 4) - messages per edge
 ```
 
-### SE(3)-Equivariant Transformer (requires DGL)
+### SE(3)-Equivariant Transformer
 
 ```python
 import torch
 import lr_geom as lg
 
-if lg.is_dgl_available():
-    import dgl
+# Node coordinates and features
+num_nodes = 50
+coordinates = torch.randn(num_nodes, 3)
+node_features = torch.randn(num_nodes, 4, 4)  # (N, mult, repr_dim)
 
-    # Create a random graph
-    num_nodes, num_edges = 50, 200
-    src = torch.randint(0, num_nodes, (num_edges,))
-    dst = torch.randint(0, num_nodes, (num_edges,))
-    graph = dgl.graph((src, dst))
+# Build equivariant transformer with k-NN attention
+model = lg.EquivariantTransformer(
+    in_repr=lg.Repr(lvals=[0, 1], mult=4),
+    out_repr=lg.Repr(lvals=[0, 1], mult=1),
+    hidden_repr=lg.Repr(lvals=[0, 1], mult=16),
+    hidden_layers=4,
+    k_neighbors=16,      # k-NN graph built automatically from coordinates
+    edge_dim=16,
+    edge_hidden_dim=32,
+    nheads=4,
+    dropout=0.1,
+    attn_dropout=0.1,
+    transition=True,     # include FFN blocks
+)
 
-    # Node coordinates and features
-    coordinates = torch.randn(num_nodes, 3)
-    node_features = torch.randn(num_nodes, 4, 4)  # (N, mult, repr_dim)
-    edge_features = torch.randn(num_edges, 16)     # invariant edge features
+# Forward pass - k-NN graph is built automatically from coordinates
+output = model(coordinates, node_features)  # (50, 1, 4)
 
-    # Build equivariant transformer
-    model = lg.EquivariantTransformer(
-        in_repr=lg.Repr(lvals=[0, 1], mult=4),
-        out_repr=lg.Repr(lvals=[0, 1], mult=1),
-        hidden_repr=lg.Repr(lvals=[0, 1], mult=16),
-        hidden_layers=4,
-        edge_dim=16,
-        edge_hidden_dim=32,
-        nheads=4,
-        dropout=0.1,
-        attn_dropout=0.1,
-        transition=True,  # include FFN blocks
-    )
-
-    # Forward pass
-    output = model(
-        graph=graph,
-        coordinates=coordinates,
-        node_features=node_features,
-        edge_features=edge_features,
-    )  # (50, 1, 4)
-
-    # The output transforms equivariantly under rotations:
-    # If we rotate coordinates and input features, output rotates the same way
+# The output transforms equivariantly under rotations:
+# If we rotate coordinates and input features, output rotates the same way
 ```
 
 ### Custom Equivariant Model Example
@@ -280,6 +266,51 @@ x = torch.randn(32, 4, 9)
 y = model(x)  # (32, 1, 9)
 ```
 
+### SO(3)-Equivariant VAE
+
+```python
+import torch
+import lr_geom as lg
+from lr_geom.vae import EquivariantVAE, kl_divergence
+
+# Define representations
+in_repr = lg.Repr([0, 1], mult=8)      # Input features
+latent_repr = lg.Repr([0, 1], mult=4)  # Latent space
+out_repr = lg.Repr([0, 1], mult=1)     # Output (e.g., for reconstruction)
+hidden_repr = lg.Repr([0, 1], mult=16) # Hidden layers
+
+# Create equivariant VAE
+vae = EquivariantVAE(
+    in_repr=in_repr,
+    latent_repr=latent_repr,
+    out_repr=out_repr,
+    hidden_repr=hidden_repr,
+    encoder_layers=4,
+    decoder_layers=4,
+    k_neighbors=16,
+    nheads=4,
+)
+
+# Training
+coords = torch.randn(50, 3)
+features = torch.randn(50, in_repr.mult, in_repr.dim())
+target = torch.randn(50, out_repr.mult, out_repr.dim())
+
+recon, mu, logvar = vae(coords, features)
+
+# Loss: reconstruction + KL divergence
+recon_loss = ((recon - target) ** 2).mean()
+kl_loss = kl_divergence(mu, logvar)
+loss = recon_loss + 0.01 * kl_loss
+
+# Sampling from prior
+samples = vae.sample(coords)  # (50, out_mult, out_dim)
+
+# Equivariance property:
+# - encode(R*coords, D*features) = (D*mu, logvar)  # mu rotates, logvar invariant
+# - decode(R*coords, D*z) = D*decode(coords, z)    # output rotates correctly
+```
+
 ## Package Structure
 
 ```
@@ -289,7 +320,10 @@ lr_geom/
 ├── equivariant.py     - Equivariant primitives (SphericalHarmonic, RadialBasisFunctions)
 ├── layers.py          - Equivariant layers (Linear, Attention, Transformer)
 ├── models.py          - Pre-built models (RadialWeight, GNMA)
-└── nn.py              - Basic neural network utilities
+├── nn.py              - Basic neural network utilities
+└── vae/               - SO(3)-equivariant variational autoencoder
+    ├── __init__.py
+    └── model.py       - EquivariantVAE, VariationalHead, losses
 ```
 
 ## API Reference
@@ -302,7 +336,7 @@ lr_geom/
 | `Repr(lvals, mult)` | Direct sum of irreps with multiplicity |
 | `ProductRepr(rep1, rep2)` | Tensor product of two representations |
 
-### Layers (no DGL required)
+### Layers
 
 | Class | Description |
 |-------|-------------|
@@ -313,15 +347,20 @@ lr_geom/
 | `EquivariantConvolution` | Low-rank equivariant convolution |
 | `RepNorm` | Compute norms of irrep components |
 | `EquivariantBasis` | Compute equivariant basis matrices |
-
-### Layers (require DGL)
-
-| Class | Description |
-|-------|-------------|
-| `GraphAttention` | Multi-head graph attention |
-| `EquivariantAttention` | SE(3)-equivariant attention |
+| `Attention` | Multi-head k-NN attention |
+| `EquivariantAttention` | SE(3)-equivariant k-NN attention |
 | `EquivariantTransformerBlock` | Single transformer block |
 | `EquivariantTransformer` | Full equivariant transformer |
+| `build_knn_graph` | Build k-NN graph from coordinates |
+
+### VAE
+
+| Class/Function | Description |
+|----------------|-------------|
+| `EquivariantVAE` | SO(3)-equivariant variational autoencoder |
+| `VariationalHead` | Produces equivariant mu and invariant logvar |
+| `reparameterize` | VAE reparameterization trick |
+| `kl_divergence` | KL divergence loss for VAE training |
 
 ### Alignment
 

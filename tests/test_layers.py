@@ -499,6 +499,10 @@ class TestAttention:
 # EQUIVARIANTTRANSFORMER TESTS (requires sphericart)
 # ============================================================================
 
+# Note: EquivariantAttention and EquivariantTransformerBlock are tested
+# implicitly through EquivariantTransformer tests. Testing them in isolation
+# requires matching the internal basis computation which is complex.
+
 @requires_sphericart
 class TestEquivariantTransformer:
     """Tests for EquivariantTransformer model."""
@@ -604,6 +608,47 @@ class TestEquivariantTransformer:
                 changed = True
                 break
         assert changed, "No parameters were updated"
+
+    def test_equivariance(self, transformer_setup, rotation_params):
+        """Test SE(3) equivariance of the full transformer.
+
+        For rotation R and Wigner D:
+        - model(R @ coords, D @ features) == D @ model(coords, features)
+
+        Note: Uses slightly relaxed tolerance (5e-3) compared to single layers
+        because numerical errors accumulate through multiple transformer blocks.
+        """
+        axis, angle = rotation_params
+        setup = transformer_setup
+        model = setup['model']
+        model.eval()
+
+        in_repr = setup['in_repr']
+        out_repr = setup['out_repr']
+        coords = setup['coordinates']
+        features = setup['node_features']
+
+        # Get rotation matrices
+        D_in = get_wigner_d_matrix(in_repr, axis, angle)
+        D_out = get_wigner_d_matrix(out_repr, axis, angle)
+        R = get_3d_rotation_matrix(axis, angle)
+
+        # Rotate inputs
+        coords_rotated = coords @ R.T
+        features_rotated = features @ D_in.T
+
+        # Forward on rotated inputs
+        output_from_rotated = model(coords_rotated, features_rotated)
+
+        # Forward then rotate
+        output_original = model(coords, features)
+        output_rotated = output_original @ D_out.T
+
+        # Use relaxed tolerance for deep networks (numerical error accumulates)
+        transformer_rtol = 5e-3  # 0.5% relative tolerance
+        transformer_atol = 5e-3  # Relaxed absolute tolerance for values O(10-100)
+        assert torch.allclose(output_from_rotated, output_rotated, rtol=transformer_rtol, atol=transformer_atol), \
+            f"Max diff: {(output_from_rotated - output_rotated).abs().max()}"
 
 
 # ============================================================================
