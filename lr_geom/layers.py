@@ -801,7 +801,7 @@ class EquivariantTransformerBlock(nn.Module):
         features = self.attn(basis, edge_feats, features, neighbor_idx, mask)
 
         if self.skip:
-            features = features + self.residual_scale * features_tmp
+            features = features_tmp + self.residual_scale * features
 
         if self.transition is not None:
             if self.skip:
@@ -809,7 +809,7 @@ class EquivariantTransformerBlock(nn.Module):
             features = self.ln2(features)
             features = self.transition(features)
             if self.skip:
-                features = features + self.residual_scale * features_tmp
+                features = features_tmp + self.residual_scale * features
 
         return features
 

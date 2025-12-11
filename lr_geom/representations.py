@@ -69,6 +69,10 @@ class Irrep:
         [-2, -1, 0, 1, 2]
     """
 
+    # Class constants for dtype consistency
+    REAL_DTYPE = torch.float32
+    COMPLEX_DTYPE = torch.complex128
+
     def __init__(
         self: Irrep,
         l: int,
@@ -81,8 +85,6 @@ class Irrep:
 
         self.l = l
         self.mult = mult
-        self.real_dtype = torch.float32
-        self.complex_dtype = torch.complex128
 
     def __eq__(
         self: Irrep,
@@ -107,14 +109,14 @@ class Irrep:
         Returns:
             List of m values from -l to l in increasing order.
         """
-        return [m for m in range(-self.l, self.l + 1)]
+        return list(range(-self.l, self.l + 1))
 
     def offset(self: Irrep) -> int:
         """Return the offset of this representation from degree 0.
 
         This is the sum of dimensions of all irreps with lower degree.
         """
-        return sum(Irrep(l).dim() for l in range(0, self.l))
+        return sum(Irrep(l).dim() for l in range(self.l))
 
     def raising(self: Irrep) -> torch.Tensor:
         """Compute the raising operator J_+ for this irreducible representation.
@@ -165,7 +167,7 @@ class Irrep:
         geny = -0.5j * (raising - lowering)
 
         # Get the z generator as a diagonal matrix
-        mvals = torch.tensor(self.mvals(), dtype=self.complex_dtype)
+        mvals = torch.tensor(self.mvals(), dtype=self.COMPLEX_DTYPE)
         genz = 1j * torch.diag(mvals)
 
         # Stack the results (order: x, z, y for sphericart compatibility)
@@ -174,7 +176,7 @@ class Irrep:
         # Convert from complex to real representations
         Q = self.toreal()
         out = Q.t().conj() @ gens @ Q
-        return out.real.to(self.real_dtype)
+        return out.real.to(self.REAL_DTYPE)
 
     def toreal(self: Irrep) -> torch.Tensor:
         """Get the conversion matrix from complex to real spherical harmonics.
@@ -186,13 +188,12 @@ class Irrep:
 
         q = torch.zeros(self.dim(), self.dim(), dtype=torch.complex128)
 
-        # Fill in the negative degrees
+        # Fill in the negative degrees (m < 0)
         for m in range(-self.l, 0):
             q[self.l + m, self.l + abs(m)] = SQRT2
             q[self.l + m, self.l - abs(m)] = -1j * SQRT2
-            q[self.l, self.l] = 1
 
-        # Fill in the positive degrees
+        # Fill in the positive degrees (m > 0)
         for m in range(1, self.l + 1):
             q[self.l + m, self.l + abs(m)] = (-1)**m * SQRT2
             q[self.l + m, self.l - abs(m)] = 1j * (-1)**m * SQRT2
@@ -258,8 +259,11 @@ class ProductIrrep:
         ]
 
     def offset(self: ProductIrrep) -> int:
-        """Return the offset of this representation from degree 0."""
-        return sum(Irrep(l).dim() for l in range(0, self.lmin))
+        """Return the offset of this representation from degree 0.
+
+        This is the sum of dimensions of all irreps with degree < lmin.
+        """
+        return sum(Irrep(l).dim() for l in range(self.lmin))
 
     def nreps(self: ProductIrrep) -> int:
         """Return the number of irreps in the decomposition."""
@@ -321,12 +325,31 @@ class Repr(nn.Module):
         self.lvals = [irrep.l for irrep in self.irreps]
         self.mult = mult
 
+        # Pre-compute cumulative dimensions for indexing
+        self._cumdims = [
+            sum(rep.dim() for rep in self.irreps[:i])
+            for i in range(len(self.irreps) + 1)
+        ]
+
+        # Pre-compute indices mapping each dimension to its irrep index
+        self._indices = [
+            repnum
+            for repnum, irrep in enumerate(self.irreps)
+            for _ in range(irrep.dim())
+        ]
+
         # Pre-compute the so(3) generators and reshape for efficient computation
         self.register_buffer(
             'generators',
             self._generators().view(3, -1)
         )
         self.perm = self._reorder_generators()
+
+        # Register indices as buffer for efficient dot product computation
+        self.register_buffer(
+            '_indices_tensor',
+            torch.tensor(self._indices, dtype=torch.long)
+        )
 
     def nreps(self: Repr) -> int:
         """Return the number of irreducible representations."""
@@ -356,10 +379,7 @@ class Repr(nn.Module):
 
     def cumdims(self: Repr) -> list[int]:
         """Get cumulative dimensions for indexing into subspaces."""
-        return [
-            sum(rep.dim() for rep in self.irreps[:l])
-            for l in range(self.nreps() + 1)
-        ]
+        return self._cumdims
 
     def offsets(self: Repr) -> list[int]:
         """Return the offset of each irrep from degree 0."""
@@ -372,11 +392,7 @@ class Repr(nn.Module):
             List of length dim() where entry i gives the irrep index
             that dimension i belongs to.
         """
-        return [
-            repnum
-            for repnum, irrep in enumerate(self)
-            for _ in range(irrep.dim())
-        ]
+        return self._indices
 
     def verify(self: Repr, st: torch.Tensor) -> bool:
         """Check if a tensor has the correct shape for this representation.
@@ -408,7 +424,8 @@ class Repr(nn.Module):
         Returns:
             Tensor with one value per irrep.
         """
-        ix = torch.tensor(self.indices(), device=st1.device)
+        # Use pre-computed indices tensor (registered as buffer)
+        ix = self._indices_tensor.to(st1.device)
         product = st1 * st2
 
         # Use native PyTorch scatter_add instead of torch_scatter
@@ -520,10 +537,10 @@ class Repr(nn.Module):
 
         # Restore identity for degree-0 (scalar) irreps
         # Scalars are invariant under rotation, including "invalid" rotations
+        cdims = self.cumdims()
         for i, irrep in enumerate(self.irreps):
             if irrep.l == 0:
-                idx = self.cumdims()[i]
-                rot[..., idx, idx] = 1.0
+                rot[..., cdims[i], cdims[i]] = 1.0
 
         return rot
 
@@ -583,10 +600,11 @@ class ProductRepr:
             for irrep1 in rep1
             for irrep2 in rep2
         ]
-        self.offsets = itertools.product(
+        # Store as list to allow multiple iterations (generators exhaust after one use)
+        self.offsets = list(itertools.product(
             rep1.cumdims()[:-1],
             rep2.cumdims()[:-1],
-        )
+        ))
 
     def dim(self: ProductRepr) -> int:
         """Get total dimension of the tensor product."""

@@ -64,7 +64,9 @@ class RepNorm(nn.Module):
     def __init__(self: RepNorm, repr: Repr) -> None:
         super().__init__()
         self.nreps = repr.nreps()
-        self.cdims = repr.cumdims()
+        # Store slices for efficient indexing
+        cdims = repr.cumdims()
+        self.slices = [(cdims[i], cdims[i + 1]) for i in range(self.nreps)]
 
     def forward(self: RepNorm, st: torch.Tensor) -> torch.Tensor:
         """Compute the norm of each irrep component.
@@ -81,10 +83,8 @@ class RepNorm(nn.Module):
             dtype=st.dtype,
         )
 
-        for i in range(self.nreps):
-            norms[..., i] = st[
-                ..., self.cdims[i]:self.cdims[i + 1],
-            ].norm(dim=-1)  # Fixed: was REPR_DIM (undefined)
+        for i, (low, high) in enumerate(self.slices):
+            norms[..., i] = st[..., low:high].norm(dim=-1)
 
         return norms
 
@@ -119,6 +119,9 @@ class SphericalHarmonic(nn.Module):
     ) -> None:
         super().__init__()
 
+        if not isinstance(lmax, int) or lmax < 0:
+            raise ValueError(f"lmax must be a non-negative integer, got {lmax}")
+
         sc = _get_sphericart()
         if sc is None:
             raise ImportError(
@@ -130,7 +133,7 @@ class SphericalHarmonic(nn.Module):
         self.lmax = lmax
 
         # Index permutation for sphericart coordinate convention
-        self.ix = torch.tensor([2, 0, 1], dtype=torch.int64)
+        self.register_buffer('ix', torch.tensor([2, 0, 1], dtype=torch.int64))
 
     def forward(self: SphericalHarmonic, x: torch.Tensor) -> torch.Tensor:
         """Compute spherical harmonic features for points.
@@ -210,6 +213,11 @@ class RadialBasisFunctions(nn.Module):
     ) -> None:
         super().__init__()
 
+        if not isinstance(num_functions, int) or num_functions < 1:
+            raise ValueError(f"num_functions must be a positive integer, got {num_functions}")
+        if r_max <= r_min:
+            raise ValueError(f"r_max ({r_max}) must be greater than r_min ({r_min})")
+
         # Initialize centers evenly spaced in [r_min, r_max]
         self.mu = nn.Parameter(
             torch.linspace(r_min, r_max, num_functions),
@@ -263,7 +271,20 @@ class EquivariantBasis(nn.Module):
 
         # Spherical harmonic calculator
         self.sh = SphericalHarmonic(repr.lmax())
-        self.repr = repr
+
+        # Pre-compute slice indices for efficient forward pass
+        # Each tuple: (coeff_slice_start, coeff_slice_end, sh_slice_start, sh_slice_end, irrep_idx)
+        cdims1 = repr.rep1.cumdims()
+        self.slices1 = [
+            (cdims1[j], cdims1[j + 1], l ** 2, (l + 1) ** 2, j)
+            for j, l in enumerate(repr.rep1.lvals)
+        ]
+
+        cdims2 = repr.rep2.cumdims()
+        self.slices2 = [
+            (cdims2[j], cdims2[j + 1], l ** 2, (l + 1) ** 2, j)
+            for j, l in enumerate(repr.rep2.lvals)
+        ]
 
     def forward(
         self: EquivariantBasis,
@@ -283,19 +304,15 @@ class EquivariantBasis(nn.Module):
         sh = self.sh(x)
         sh = torch.nan_to_num(sh, nan=0.0)
 
-        # Build coefficient matrices
-        coeff1 = torch.zeros(x.size(0), *self.outdims1, device=x.device)
-        coeff2 = torch.zeros(x.size(0), *self.outdims2, device=x.device)
+        # Build coefficient matrices using pre-computed slices
+        coeff1 = torch.zeros(x.size(0), *self.outdims1, device=x.device, dtype=x.dtype)
+        coeff2 = torch.zeros(x.size(0), *self.outdims2, device=x.device, dtype=x.dtype)
 
-        for j in range(self.repr.rep1.nreps()):
-            low = j ** 2
-            high = (j + 1) ** 2
-            coeff1[..., low:high, j] = sh[..., low:high]
+        for c_low, c_high, sh_low, sh_high, j in self.slices1:
+            coeff1[..., c_low:c_high, j] = sh[..., sh_low:sh_high]
 
-        for j in range(self.repr.rep2.nreps()):
-            low = j ** 2
-            high = (j + 1) ** 2
-            coeff2[..., j, low:high] = sh[..., low:high]
+        for c_low, c_high, sh_low, sh_high, j in self.slices2:
+            coeff2[..., j, c_low:c_high] = sh[..., sh_low:sh_high]
 
         return coeff1, coeff2
 

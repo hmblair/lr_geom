@@ -393,6 +393,48 @@ class TestEquivariantConvolution:
         assert node_features.grad is not None
         assert edge_features.grad is not None
 
+    def test_equivariance_different_lvals(self, edge_dim, hidden_dim, num_nodes, num_edges, rotation_params):
+        """Test equivariance when input and output have different lvals."""
+        axis, angle = rotation_params
+
+        # Input: scalars + vectors, Output: vectors only
+        in_repr = lg.Repr(lvals=[0, 1], mult=4)
+        out_repr = lg.Repr(lvals=[1], mult=4)
+        product_repr = lg.ProductRepr(in_repr, out_repr)
+
+        layer = lg.EquivariantConvolution(product_repr, edge_dim, hidden_dim)
+        layer.eval()
+
+        # Create basis
+        basis_layer = lg.EquivariantBasis(product_repr)
+        edge_vectors = torch.randn(num_edges, 3)
+        bases = basis_layer(edge_vectors)
+
+        # Create data
+        node_features = torch.randn(num_nodes, in_repr.mult, in_repr.dim())
+        edge_features = torch.randn(num_edges, edge_dim)
+        src_idx = torch.randint(0, num_nodes, (num_edges,))
+
+        # Get rotation matrices for input and output (different dims!)
+        D_in = get_wigner_d_matrix(in_repr, axis, angle)
+        D_out = get_wigner_d_matrix(out_repr, axis, angle)
+        R = get_3d_rotation_matrix(axis, angle)
+
+        # Rotate inputs
+        node_features_rotated = node_features @ D_in.T
+        edge_vectors_rotated = edge_vectors @ R.T
+        bases_rotated = basis_layer(edge_vectors_rotated)
+
+        # Forward on rotated inputs
+        output_from_rotated = layer(bases_rotated, edge_features, node_features_rotated, src_idx)
+
+        # Forward on original, then rotate output
+        output_original = layer(bases, edge_features, node_features, src_idx)
+        output_rotated = output_original @ D_out.T
+
+        assert torch.allclose(output_from_rotated, output_rotated, rtol=RTOL, atol=ATOL), \
+            f"Max diff: {(output_from_rotated - output_rotated).abs().max()}"
+
 
 # ============================================================================
 # EQUIVARIANTTRANSITION TESTS
