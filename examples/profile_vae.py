@@ -73,6 +73,8 @@ class ProfilerConfig:
     device: str = "cuda"
     attention_type: str = "node_wise"
     radial_weight_rank: int | None = None
+    use_compile: bool = False
+    compile_mode: str = "reduce-overhead"
 
 
 class LayerProfiler:
@@ -445,8 +447,12 @@ class LayerProfiler:
             radial_weight_rank=self.config.radial_weight_rank,
         ).to(self.device)
 
+        if self.config.use_compile:
+            transformer.compile(mode=self.config.compile_mode)
+
+        compile_str = " [compiled]" if self.config.use_compile else ""
         return self._profile_forward(
-            f"EquivariantTransformer (2 layers, {self.config.attention_type})",
+            f"EquivariantTransformer (2 layers, {self.config.attention_type}){compile_str}",
             transformer,
             lambda: transformer(self.coords, self.features_in),
         )
@@ -466,8 +472,12 @@ class LayerProfiler:
             radial_weight_rank=self.config.radial_weight_rank,
         ).to(self.device)
 
+        if self.config.use_compile:
+            vae.compile(mode=self.config.compile_mode)
+
+        compile_str = " [compiled]" if self.config.use_compile else ""
         return self._profile_forward(
-            f"EquivariantVAE (2+2 layers, {self.config.attention_type})",
+            f"EquivariantVAE (2+2 layers, {self.config.attention_type}){compile_str}",
             vae,
             lambda: vae(self.coords, self.features_in),
         )
@@ -482,6 +492,7 @@ class LayerProfiler:
         print(f"  hidden_mult: {self.config.hidden_mult}")
         print(f"  attention_type: {self.config.attention_type}")
         print(f"  radial_weight_rank: {self.config.radial_weight_rank or 'full'}")
+        print(f"  torch.compile: {self.config.use_compile} (mode={self.config.compile_mode})")
         print(f"  device: {self.device}")
         print(f"  warmup: {self.config.warmup}, iterations: {self.config.iterations}")
         print()
@@ -598,6 +609,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention_type", type=str, default="node_wise", choices=["node_wise", "edge_wise"])
     parser.add_argument("--radial_weight_rank", type=int, default=None)
     parser.add_argument("--compare", action="store_true", help="Compare multiple configurations")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile for Transformer/VAE")
+    parser.add_argument("--compile_mode", type=str, default="reduce-overhead",
+                        choices=["reduce-overhead", "max-autotune", "default"],
+                        help="torch.compile mode")
     return parser.parse_args()
 
 
@@ -662,6 +677,8 @@ def main():
             device=args.device,
             attention_type=args.attention_type,
             radial_weight_rank=args.radial_weight_rank,
+            use_compile=args.compile,
+            compile_mode=args.compile_mode,
         )
 
         profiler = LayerProfiler(config)

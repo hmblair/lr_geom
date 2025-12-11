@@ -350,3 +350,34 @@ class EquivariantVAE(nn.Module):
             dtype=dtype,
         )
         return self.decode(coords, z)
+
+    def compile(
+        self,
+        mode: str = "reduce-overhead",
+        fullgraph: bool = False,
+    ) -> "EquivariantVAE":
+        """Compile the model using torch.compile for faster execution.
+
+        Applies torch.compile to optimize the forward pass with kernel fusion
+        and graph optimizations. Compiles encoder and decoder separately for
+        better optimization.
+
+        Args:
+            mode: Compilation mode. Options:
+                - "reduce-overhead": Reduces Python overhead (default, best for inference)
+                - "max-autotune": Maximum optimization (slower compile, faster runtime)
+                - "default": Balanced compilation
+            fullgraph: If True, requires the entire forward to compile as one graph.
+                Set to False (default) to allow graph breaks for compatibility.
+
+        Returns:
+            Self for method chaining.
+
+        Example:
+            >>> vae = EquivariantVAE(...).compile()
+            >>> recon, mu, logvar = vae(coords, features)  # Compiled execution
+        """
+        # Compile encoder and decoder transformers
+        self.encoder.compile(mode=mode, fullgraph=fullgraph)
+        self.decoder.compile(mode=mode, fullgraph=fullgraph)
+        return self

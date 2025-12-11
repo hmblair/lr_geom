@@ -165,6 +165,8 @@ class RadialWeight(nn.Module):
     def forward(self: RadialWeight, x: torch.Tensor) -> torch.Tensor:
         """Compute weights from edge features.
 
+        Uses fused linear+GELU operations for better performance with torch.compile.
+
         Args:
             x: Edge features of shape (..., edge_dim).
 
@@ -173,17 +175,21 @@ class RadialWeight(nn.Module):
         """
         *b, _ = x.size()
 
-        h = self.layer1(x)
-        h = self.activation(h)
+        # Fused linear + GELU (approximate='tanh' is faster and torch.compile friendly)
+        h = F.linear(x, self.layer1.weight, self.layer1.bias)
+        h = F.gelu(h, approximate='tanh')
         h = self.dropout(h)
 
         if self.rank is None:
             # Full-rank path
-            return self.layer2(h).view(*b, self.out_rows, self.out_cols)
+            out = F.linear(h, self.layer2.weight, self.layer2.bias)
+            return out.view(*b, self.out_rows, self.out_cols)
         else:
             # Low-rank path: compute A @ B
-            left = self.layer_left(h).view(*b, self.out_rows, self.rank)
-            right = self.layer_right(h).view(*b, self.rank, self.out_cols)
+            left = F.linear(h, self.layer_left.weight, self.layer_left.bias)
+            right = F.linear(h, self.layer_right.weight, self.layer_right.bias)
+            left = left.view(*b, self.out_rows, self.rank)
+            right = right.view(*b, self.rank, self.out_cols)
             return left @ right
 
 
@@ -1268,3 +1274,37 @@ class EquivariantTransformer(nn.Module):
         # Final layer norm and output projection
         node_features = self.final_ln(node_features)
         return self.proj(node_features)
+
+    def compile(
+        self: EquivariantTransformer,
+        mode: str = "reduce-overhead",
+        fullgraph: bool = False,
+    ) -> EquivariantTransformer:
+        """Compile the model using torch.compile for faster execution.
+
+        Applies torch.compile to optimize the forward pass with kernel fusion
+        and graph optimizations. Best speedups are seen on GPU with repeated
+        inference or training iterations.
+
+        Args:
+            mode: Compilation mode. Options:
+                - "reduce-overhead": Reduces Python overhead (default, best for inference)
+                - "max-autotune": Maximum optimization (slower compile, faster runtime)
+                - "default": Balanced compilation
+            fullgraph: If True, requires the entire forward to compile as one graph.
+                Set to False (default) to allow graph breaks for compatibility.
+
+        Returns:
+            Self for method chaining.
+
+        Example:
+            >>> model = EquivariantTransformer(...).compile()
+            >>> output = model(coords, features)  # Compiled execution
+        """
+        # Compile the forward method in-place
+        self.forward = torch.compile(
+            self.forward,
+            mode=mode,
+            fullgraph=fullgraph,
+        )
+        return self
