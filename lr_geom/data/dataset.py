@@ -248,9 +248,11 @@ class StructureDataset(Dataset):
         if level == "residue":
             polymer, _ = polymer.center(ciffy.RESIDUE)
             features = polymer.sequence
+            max_idx = ciffy.NUM_RESIDUES - 1
         else:
             polymer, _ = polymer.center()
             features = polymer.atoms
+            max_idx = ciffy.NUM_ATOMS - 1
 
         # Normalize coordinates
         coords = polymer.coordinates.float()
@@ -259,7 +261,7 @@ class StructureDataset(Dataset):
 
         return Structure(
             coords=coords_normalized,
-            features=features.long().clamp(min=0),
+            features=features.long().clamp(min=0, max=max_idx),
             coord_scale=coord_scale,
             polymer=polymer,
             id=polymer.id(),
