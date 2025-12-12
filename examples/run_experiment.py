@@ -321,7 +321,12 @@ def save_reconstructions(
     output_dir: Path,
     num_samples: int = 3,
 ) -> list[str]:
-    """Save original and reconstructed structures as .cif files.
+    """Save original, reconstructed, and sampled structures as .cif files.
+
+    For each structure, saves:
+    - Original structure
+    - Reconstruction (encode -> decode)
+    - Sample (random latent z from prior + conditioning -> decode)
 
     Args:
         embedding: Atom embedding module.
@@ -351,27 +356,35 @@ def save_reconstructions(
             polymer = s["polymer"]
             struct_id = s["id"]
 
-            # Forward pass
+            # Get features (conditioning)
             features = embedding(atoms).unsqueeze(-1)
+
+            # Reconstruction: encode -> decode
             recon, _, _ = vae(coords, features)
+            coords_recon = recon[:, 0, :]
+            coords_recon_unnorm = coords_recon * coord_scale
 
-            # Get predicted coordinates (unnormalized)
-            coords_pred = recon[:, 0, :]
-            coords_pred_unnorm = coords_pred * coord_scale
+            # Sample: random z from prior + conditioning -> decode
+            sampled = vae.sample(coords, features)
+            coords_sampled = sampled[:, 0, :]
+            coords_sampled_unnorm = coords_sampled * coord_scale
 
-            # Create reconstructed polymer
-            pred_polymer = polymer.with_coordinates(coords_pred_unnorm)
+            # Create polymers
+            recon_polymer = polymer.with_coordinates(coords_recon_unnorm)
+            sampled_polymer = polymer.with_coordinates(coords_sampled_unnorm)
 
-            # Save original and reconstructed structures
+            # Save structures
             safe_id = struct_id.replace("/", "_").replace(" ", "_")
             original_path = recon_dir / f"{safe_id}_original.cif"
             recon_path = recon_dir / f"{safe_id}_reconstructed.cif"
+            sampled_path = recon_dir / f"{safe_id}_sampled.cif"
 
             try:
                 polymer.write(str(original_path))
-                pred_polymer.write(str(recon_path))
+                recon_polymer.write(str(recon_path))
+                sampled_polymer.write(str(sampled_path))
                 saved_ids.append(struct_id)
-                print(f"  Saved reconstruction for {struct_id}")
+                print(f"  Saved reconstruction and sample for {struct_id}")
             except Exception as e:
                 print(f"  Warning: Could not save {struct_id}: {e}")
 

@@ -502,7 +502,12 @@ def save_example_reconstruction(
     epoch: int,
     sample_idx: int = 0,
 ) -> None:
-    """Save an example structure and its reconstruction.
+    """Save an example structure, its reconstruction, and a sample.
+
+    Saves three structures:
+    - Original structure (only on first epoch)
+    - Reconstruction (encode -> decode)
+    - Sample (random z from prior + conditioning -> decode)
 
     Args:
         model: The VAE model.
@@ -526,10 +531,19 @@ def save_example_reconstruction(
         coords_normalized = (coords / coord_scale).to(device)
         atoms = polymer.atoms.long().to(device).clamp(min=0)
 
+        # Get atom embeddings (conditioning)
+        features = model.atom_embedding(atoms)
+
         # Get reconstruction (in normalized space, then un-normalize)
         recon, mu, logvar = model(coords_normalized, atoms)
         coords_recon_normalized = model.get_coord_reconstruction(recon)
         coords_recon = coords_recon_normalized * coord_scale.to(device)
+
+        # Get sample from prior (random z + conditioning)
+        with torch.no_grad():
+            sampled = model.vae.sample(coords_normalized, features)
+        coords_sampled_normalized = model.get_coord_reconstruction(sampled)
+        coords_sampled = coords_sampled_normalized * coord_scale.to(device)
 
         # Save original (only on first epoch)
         if epoch == 1:
@@ -538,11 +552,16 @@ def save_example_reconstruction(
 
         # Save reconstruction
         recon_polymer = polymer.with_coordinates(coords_recon.cpu())
-        recon_path = output_dir / f"{polymer.id()}_epoch{epoch:03d}.cif"
+        recon_path = output_dir / f"{polymer.id()}_epoch{epoch:03d}_recon.cif"
         recon_polymer.write(str(recon_path))
 
+        # Save sample
+        sampled_polymer = polymer.with_coordinates(coords_sampled.cpu())
+        sampled_path = output_dir / f"{polymer.id()}_epoch{epoch:03d}_sample.cif"
+        sampled_polymer.write(str(sampled_path))
+
     except Exception as e:
-        print(f"Warning: Failed to save reconstruction: {e}")
+        print(f"Warning: Failed to save reconstruction/sample: {e}")
 
 
 def main():
