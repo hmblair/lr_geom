@@ -19,6 +19,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from tqdm import tqdm
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -205,7 +206,8 @@ def train_epoch(
     indices = list(range(len(structures)))
     random.shuffle(indices)
 
-    for idx in indices:
+    pbar = tqdm(indices, desc="Training", leave=False, ncols=80)
+    for idx in pbar:
         s = structures[idx]
         coords = s["coords"]
         atoms = s["atoms"]
@@ -241,6 +243,9 @@ def train_epoch(
         total_rmsd += rmsd_loss.item()
         total_kl += kl_loss.item()
         n_batches += 1
+
+        # Update progress bar with running average RMSD
+        pbar.set_postfix({"RMSD": f"{total_rmsd / n_batches:.2f}Å"})
 
     epoch_time = time.time() - epoch_start
 
@@ -477,7 +482,8 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3) -> dict
     patience_counter = 0
 
     print("Training...")
-    for epoch in range(1, config.training.epochs + 1):
+    epoch_pbar = tqdm(range(1, config.training.epochs + 1), desc="Epochs", ncols=100)
+    for epoch in epoch_pbar:
         # Train
         train_metrics = train_epoch(
             embedding, vae, train_structures, optimizer, config.training, device
@@ -502,10 +508,12 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3) -> dict
                 scheduler.step()
 
         # Early stopping
+        is_best = False
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_val_rmsd = val_rmsd
             patience_counter = 0
+            is_best = True
             # Save best model
             torch.save({
                 "embedding": embedding.state_dict(),
@@ -517,16 +525,15 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3) -> dict
         else:
             patience_counter += 1
 
-        # Log progress
-        lr = optimizer.param_groups[0]["lr"]
-        log_str = (
-            f"Epoch {epoch:3d} | "
-            f"Train RMSD: {train_metrics['rmsd']:.2f}Å | "
-        )
-        if val_structures:
-            log_str += f"Val RMSD: {val_metrics['rmsd']:.2f}Å | "
-        log_str += f"Time: {train_metrics['time']:.1f}s | LR: {lr:.2e}"
-        print(log_str)
+        # Update progress bar
+        postfix = {
+            "train": f"{train_metrics['rmsd']:.2f}Å",
+            "val": f"{val_rmsd:.2f}Å",
+            "best": f"{best_val_rmsd:.2f}Å",
+        }
+        if is_best:
+            postfix["*"] = "new best"
+        epoch_pbar.set_postfix(postfix)
 
         # Early stopping check
         if config.training.early_stopping > 0 and patience_counter >= config.training.early_stopping:
