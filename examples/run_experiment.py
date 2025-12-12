@@ -111,6 +111,37 @@ def compute_kl_with_free_bits(
     return kl_per_dim.sum(dim=(-1, -2)).mean()
 
 
+def compute_distance_loss(
+    true_polymer,
+    pred_polymer,
+    scale=None,
+) -> torch.Tensor:
+    """Compute pairwise distance matrix loss for local structure preservation.
+
+    This loss encourages the model to preserve local pairwise distances,
+    not just global fit (RMSD). Helps with bond lengths and local geometry.
+
+    Args:
+        true_polymer: Ground truth polymer.
+        pred_polymer: Predicted polymer (with predicted coordinates).
+        scale: Distance scale (e.g., ciffy.RESIDUE for residue-level distances).
+            If None, uses atom-level distances.
+
+    Returns:
+        Scalar distance matrix loss (mean absolute error).
+    """
+    # Get pairwise distance matrices
+    if scale is not None:
+        D_true = true_polymer.pairwise_distance(scale)
+        D_pred = pred_polymer.pairwise_distance(scale)
+    else:
+        D_true = true_polymer.pairwise_distance()
+        D_pred = pred_polymer.pairwise_distance()
+
+    # Mean absolute error on distance matrices
+    return (D_pred - D_true).abs().mean()
+
+
 class WarmupScheduler:
     """Learning rate scheduler with linear warmup.
 
@@ -243,6 +274,7 @@ def train_epoch(
     total_loss = 0.0
     total_rmsd = 0.0
     total_kl = 0.0
+    total_dist = 0.0
     n_batches = 0
 
     epoch_start = time.time()
@@ -269,6 +301,12 @@ def train_epoch(
         kl_loss = compute_kl_with_free_bits(mu, logvar, config.free_bits)
         loss = rmsd_loss + current_kl_weight * kl_loss
 
+        # Distance matrix loss for local structure preservation
+        if config.distance_weight > 0:
+            dist_loss = compute_distance_loss(s.polymer, pred_polymer)
+            loss = loss + config.distance_weight * dist_loss
+            total_dist += dist_loss.item()
+
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
@@ -291,12 +329,16 @@ def train_epoch(
 
     epoch_time = time.time() - epoch_start
 
-    return {
+    metrics = {
         "loss": total_loss / n_batches,
         "rmsd": total_rmsd / n_batches,
         "kl": total_kl / n_batches,
         "time": epoch_time,
     }
+    if config.distance_weight > 0:
+        metrics["dist"] = total_dist / n_batches
+
+    return metrics
 
 
 def evaluate(
@@ -329,6 +371,7 @@ def evaluate(
     total_loss = 0.0
     total_rmsd = 0.0
     total_kl = 0.0
+    total_dist = 0.0
 
     with torch.no_grad():
         for s in dataset:
@@ -345,16 +388,26 @@ def evaluate(
             kl_loss = compute_kl_with_free_bits(mu, logvar, config.free_bits)
             loss = rmsd + current_kl_weight * kl_loss
 
+            # Distance matrix loss
+            if config.distance_weight > 0:
+                dist_loss = compute_distance_loss(s.polymer, pred_polymer)
+                loss = loss + config.distance_weight * dist_loss
+                total_dist += dist_loss.item()
+
             total_loss += loss.item()
             total_rmsd += rmsd.item()
             total_kl += kl_loss.item()
 
     n = len(dataset)
-    return {
+    metrics = {
         "loss": total_loss / n,
         "rmsd": total_rmsd / n,
         "kl": total_kl / n,
     }
+    if config.distance_weight > 0:
+        metrics["dist"] = total_dist / n
+
+    return metrics
 
 
 def save_reconstructions(
@@ -736,6 +789,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kl_warmup_epochs", type=int, help="Epochs to anneal KL weight")
     parser.add_argument("--kl_cycle_epochs", type=int, help="Epochs per cycle for cyclical annealing")
     parser.add_argument("--free_bits", type=float, help="Minimum KL per dimension to prevent collapse")
+    parser.add_argument("--distance_weight", type=float, help="Weight for pairwise distance matrix loss")
     parser.add_argument("--warmup_epochs", type=int, help="LR warmup epochs")
     parser.add_argument("--k_neighbors", type=int, help="Number of neighbors for k-NN graph")
     parser.add_argument("--attention_type", type=str, choices=["node_wise", "edge_wise"])

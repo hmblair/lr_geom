@@ -453,6 +453,12 @@ def parse_args() -> argparse.Namespace:
         help="Minimum KL per dimension to prevent collapse",
     )
     parser.add_argument(
+        "--distance_weight",
+        type=float,
+        default=None,
+        help="Weight for pairwise distance matrix loss (local structure)",
+    )
+    parser.add_argument(
         "--warmup_epochs",
         type=int,
         default=None,
@@ -514,6 +520,8 @@ def main():
         extra_args.extend(["--kl_cycle_epochs", str(args.kl_cycle_epochs)])
     if args.free_bits is not None:
         extra_args.extend(["--free_bits", str(args.free_bits)])
+    if args.distance_weight is not None:
+        extra_args.extend(["--distance_weight", str(args.distance_weight)])
     if args.warmup_epochs is not None:
         extra_args.extend(["--warmup_epochs", str(args.warmup_epochs)])
     if args.kl_weight is not None:

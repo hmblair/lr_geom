@@ -140,6 +140,8 @@ class TrainingConfig:
         kl_warmup_epochs: Epochs to anneal KL weight from 0 to kl_weight.
         kl_cycle_epochs: Epochs per cycle for cyclical annealing.
         free_bits: Minimum KL per latent dimension (0 to disable).
+        distance_weight: Weight for pairwise distance matrix loss (0 to disable).
+            This loss encourages preservation of local structure (bond lengths).
     """
 
     epochs: int = 100
@@ -158,6 +160,8 @@ class TrainingConfig:
     kl_cycle_epochs: int = 20
     # Free bits to prevent posterior collapse
     free_bits: float = 0.0
+    # Distance matrix loss weight (for local structure preservation)
+    distance_weight: float = 0.0
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
