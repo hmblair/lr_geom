@@ -590,6 +590,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use residue centers instead of atoms",
     )
+    parser.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="Disable torch.compile (useful for debugging)",
+    )
 
     return parser.parse_args()
 
@@ -643,6 +648,8 @@ def main():
         extra_args.extend(["--kl_weight", str(args.kl_weight)])
     if args.residue_level:
         extra_args.append("--residue_level")
+    if getattr(args, 'no_compile', False):
+        extra_args.append("--no-compile")
 
     # Verify base config exists
     if not Path(args.config).exists():
