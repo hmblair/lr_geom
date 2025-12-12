@@ -75,6 +75,9 @@ from lr_geom.training.factory import (
     model_registry,
 )
 
+# Experiment management
+from lr_geom.training.experiment_manager import ExperimentManager, ExperimentResult
+
 __all__ = [
     # Trainer
     "Trainer",
@@ -108,4 +111,7 @@ __all__ = [
     "build_equivariant_vae",
     "build_embedding_and_vae",
     "create_vae_loss_fn",
+    # Experiment management
+    "ExperimentManager",
+    "ExperimentResult",
 ]
