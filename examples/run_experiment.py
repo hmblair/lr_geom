@@ -482,13 +482,31 @@ def save_reconstructions(
     return saved_ids
 
 
-def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run: bool = False) -> dict:
+def write_progress(progress_file: str | Path | None, data: dict) -> None:
+    """Write progress to a temp file for monitoring.
+
+    Args:
+        progress_file: Path to progress file, or None to skip.
+        data: Progress data to write.
+    """
+    if progress_file is None:
+        return
+    import json
+    try:
+        with open(progress_file, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass  # Ignore write errors
+
+
+def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run: bool = False, progress_file: str | Path | None = None) -> dict:
     """Run a single experiment.
 
     Args:
         config: Experiment configuration.
         num_recon_samples: Number of test samples to save reconstructions for.
         dry_run: If True, validate setup without training (load data, build model, run one forward pass).
+        progress_file: Path to write progress updates for external monitoring.
 
     Returns:
         Dictionary of results.
@@ -703,6 +721,16 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
             postfix["*"] = "new best"
         epoch_pbar.set_postfix(postfix)
 
+        # Write progress for external monitoring
+        write_progress(progress_file, {
+            "epoch": epoch,
+            "total_epochs": config.training.epochs,
+            "train_rmsd": train_metrics["rmsd"],
+            "val_rmsd": val_rmsd,
+            "best_val_rmsd": best_val_rmsd,
+            "status": "training",
+        })
+
         # Early stopping check
         if config.training.early_stopping > 0 and patience_counter >= config.training.early_stopping:
             print(f"Early stopping at epoch {epoch}")
@@ -761,6 +789,17 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
     results["history"] = history
     torch.save(results, output_dir / "results.pt")
 
+    # Write final progress
+    write_progress(progress_file, {
+        "epoch": results["best_epoch"],
+        "total_epochs": config.training.epochs,
+        "train_rmsd": results.get("test", {}).get("rmsd", best_val_rmsd),
+        "val_rmsd": best_val_rmsd,
+        "best_val_rmsd": best_val_rmsd,
+        "test_rmsd": results.get("test", {}).get("rmsd"),
+        "status": "completed",
+    })
+
     print()
     print(f"Results saved to: {output_dir}")
 
@@ -806,6 +845,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, help="Random seed")
     parser.add_argument("--num_recon_samples", type=int, default=3, help="Number of test samples to save reconstructions for")
     parser.add_argument("--dry-run", action="store_true", help="Validate setup without training (load data, build model, run one forward pass)")
+    parser.add_argument("--progress_file", type=str, help="Path to write progress updates (for external monitoring)")
 
     return parser.parse_args()
 
@@ -823,7 +863,8 @@ def main():
 
     # Run experiment
     dry_run = getattr(args, 'dry_run', False)
-    run_experiment(config, num_recon_samples=args.num_recon_samples, dry_run=dry_run)
+    progress_file = getattr(args, 'progress_file', None)
+    run_experiment(config, num_recon_samples=args.num_recon_samples, dry_run=dry_run, progress_file=progress_file)
 
 
 if __name__ == "__main__":

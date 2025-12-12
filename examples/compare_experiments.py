@@ -65,6 +65,7 @@ def run_single_experiment(
     base_config: str,
     output_dir: str,
     extra_args: list[str],
+    progress_file: str | None = None,
 ) -> dict[str, Any]:
     """Run a single experiment on specified GPU.
 
@@ -74,6 +75,7 @@ def run_single_experiment(
         base_config: Path to base YAML config file.
         output_dir: Directory for experiment outputs.
         extra_args: Additional CLI arguments to pass.
+        progress_file: Path to write progress updates.
 
     Returns:
         Dictionary with experiment name, return code, and output.
@@ -98,6 +100,10 @@ def run_single_experiment(
     # Add attention_type if specified
     if exp_config.get("attention_type"):
         cmd.extend(["--attention_type", exp_config["attention_type"]])
+
+    # Add progress file for monitoring
+    if progress_file:
+        cmd.extend(["--progress_file", progress_file])
 
     # Add extra arguments
     cmd.extend(extra_args)
@@ -141,12 +147,30 @@ def run_single_experiment(
         }
 
 
+def read_progress(progress_file: str) -> dict | None:
+    """Read progress from a temp file.
+
+    Args:
+        progress_file: Path to progress file.
+
+    Returns:
+        Progress dict or None if file doesn't exist or can't be read.
+    """
+    import json
+    try:
+        with open(progress_file, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def run_all_experiments(
     experiments: list[dict[str, Any]],
     gpus: list[int],
     base_config: str,
     output_dir: str,
     extra_args: list[str],
+    total_epochs: int = 50,
 ) -> list[dict[str, Any]]:
     """Run all experiments concurrently across GPUs.
 
@@ -156,10 +180,15 @@ def run_all_experiments(
         base_config: Path to base YAML config file.
         output_dir: Directory for experiment outputs.
         extra_args: Additional CLI arguments.
+        total_epochs: Expected total epochs (for progress bar).
 
     Returns:
         List of result dictionaries.
     """
+    import tempfile
+    import threading
+    import time
+
     results = []
     output_path = Path(output_dir)
 
@@ -182,10 +211,28 @@ def run_all_experiments(
             results.append(result)
         return results
 
-    # GPU mode - run in parallel with progress bar
+    # GPU mode - run in parallel with per-experiment progress bars
     print(f"Running {len(experiments)} experiments across {len(gpus)} GPUs...")
     print(f"Logs will be saved to: {output_path}")
     print()
+
+    # Create temp directory for progress files
+    progress_dir = tempfile.mkdtemp(prefix="lr_geom_progress_")
+
+    # Create progress file paths and progress bars
+    progress_files = {}
+    progress_bars = {}
+    for exp in experiments:
+        name = exp["name"]
+        progress_files[name] = str(Path(progress_dir) / f"{name}.json")
+        progress_bars[name] = tqdm(
+            total=total_epochs,
+            desc=f"{name:<16}",
+            ncols=100,
+            position=len(progress_bars),
+            leave=True,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{postfix}]",
+        )
 
     # Assign experiments to GPUs round-robin
     assignments = [
@@ -193,60 +240,128 @@ def run_all_experiments(
         for i, exp in enumerate(experiments)
     ]
 
+    # Monitoring state
+    stop_monitoring = threading.Event()
+    completed_experiments = set()
+
+    def monitor_progress():
+        """Background thread to update progress bars."""
+        while not stop_monitoring.is_set():
+            for exp in experiments:
+                name = exp["name"]
+                if name in completed_experiments:
+                    continue
+                progress = read_progress(progress_files[name])
+                if progress:
+                    pbar = progress_bars[name]
+                    epoch = progress.get("epoch", 0)
+                    actual_total = progress.get("total_epochs", total_epochs)
+
+                    # Update total if different
+                    if pbar.total != actual_total:
+                        pbar.total = actual_total
+                        pbar.refresh()
+
+                    # Update progress
+                    pbar.n = epoch
+                    pbar.refresh()
+
+                    # Update postfix
+                    status = progress.get("status", "")
+                    if status == "completed":
+                        test_rmsd = progress.get("test_rmsd")
+                        if test_rmsd:
+                            pbar.set_postfix_str(f"done, test={test_rmsd:.2f}Å")
+                        else:
+                            pbar.set_postfix_str(f"done, val={progress.get('best_val_rmsd', 0):.2f}Å")
+                        completed_experiments.add(name)
+                    else:
+                        val_rmsd = progress.get("val_rmsd", 0)
+                        best_rmsd = progress.get("best_val_rmsd", 0)
+                        pbar.set_postfix_str(f"val={val_rmsd:.2f}Å best={best_rmsd:.2f}Å")
+
+            time.sleep(1)  # Update every second
+
+    # Start monitoring thread
+    monitor_thread = threading.Thread(target=monitor_progress, daemon=True)
+    monitor_thread.start()
+
+    # Run experiments
     completed = 0
     failed = 0
-    pbar = tqdm(total=len(experiments), desc="Experiments", ncols=80)
 
-    with ProcessPoolExecutor(max_workers=len(gpus)) as executor:
-        futures = {
-            executor.submit(
-                run_single_experiment,
-                exp,
-                gpu,
-                base_config,
-                output_dir,
-                extra_args,
-            ): exp
-            for exp, gpu in assignments
-        }
+    try:
+        with ProcessPoolExecutor(max_workers=len(gpus)) as executor:
+            futures = {
+                executor.submit(
+                    run_single_experiment,
+                    exp,
+                    gpu,
+                    base_config,
+                    output_dir,
+                    extra_args,
+                    progress_files[exp["name"]],
+                ): exp
+                for exp, gpu in assignments
+            }
 
-        for future in as_completed(futures):
-            exp = futures[future]
-            name = exp["name"]
-            try:
-                result = future.result()
-                success = result["returncode"] == 0
+            for future in as_completed(futures):
+                exp = futures[future]
+                name = exp["name"]
+                try:
+                    result = future.result()
+                    success = result["returncode"] == 0
 
-                # Save log file
-                log_file = output_path / f"{name}_log.txt"
-                with open(log_file, "w") as f:
-                    f.write(f"=== {name} ===\n")
-                    f.write(f"GPU: {result.get('gpu_id', 'N/A')}\n")
-                    f.write(f"Return code: {result['returncode']}\n\n")
-                    f.write("=== STDOUT ===\n")
-                    f.write(result.get("stdout", ""))
-                    f.write("\n=== STDERR ===\n")
-                    f.write(result.get("stderr", ""))
+                    # Save log file
+                    log_file = output_path / f"{name}_log.txt"
+                    with open(log_file, "w") as f:
+                        f.write(f"=== {name} ===\n")
+                        f.write(f"GPU: {result.get('gpu_id', 'N/A')}\n")
+                        f.write(f"Return code: {result['returncode']}\n\n")
+                        f.write("=== STDOUT ===\n")
+                        f.write(result.get("stdout", ""))
+                        f.write("\n=== STDERR ===\n")
+                        f.write(result.get("stderr", ""))
 
-                if success:
-                    completed += 1
-                else:
+                    if success:
+                        completed += 1
+                        # Mark as complete in progress bar
+                        pbar = progress_bars[name]
+                        pbar.n = pbar.total
+                        pbar.refresh()
+                    else:
+                        failed += 1
+                        progress_bars[name].set_postfix_str("FAILED")
+
+                    results.append(result)
+
+                except Exception as e:
                     failed += 1
+                    progress_bars[name].set_postfix_str("ERROR")
+                    results.append({
+                        "name": name,
+                        "returncode": -1,
+                        "error": str(e),
+                    })
 
-                results.append(result)
+    finally:
+        # Stop monitoring
+        stop_monitoring.set()
+        monitor_thread.join(timeout=2)
 
-            except Exception as e:
-                failed += 1
-                results.append({
-                    "name": name,
-                    "returncode": -1,
-                    "error": str(e),
-                })
+        # Close all progress bars
+        for pbar in progress_bars.values():
+            pbar.close()
 
-            pbar.update(1)
-            pbar.set_postfix({"done": completed, "failed": failed})
+        # Clean up temp files
+        import shutil
+        try:
+            shutil.rmtree(progress_dir)
+        except Exception:
+            pass
 
-    pbar.close()
+    print()
+    print(f"Completed: {completed}, Failed: {failed}")
     print()
     return results
 
@@ -558,6 +673,7 @@ def main():
         args.config,
         str(output_dir),
         extra_args,
+        total_epochs=args.epochs,
     )
 
     # Check for failures
