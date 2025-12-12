@@ -88,6 +88,8 @@ def train_epoch(
     grad_clip: float,
 ) -> dict:
     """Train for one epoch."""
+    import ciffy
+
     embedding.train()
     vae.train()
 
@@ -99,8 +101,14 @@ def train_epoch(
 
     pbar = tqdm(indices, desc="Train", leave=False, ncols=80)
     for idx in pbar:
+        structure = dataset[idx]
+
+        # Skip non-RNA chains
+        if not structure.polymer.istype(ciffy.RNA):
+            continue
+
         loss, metrics = compute_loss(
-            embedding, vae, dataset[idx], kl_weight, distance_weight
+            embedding, vae, structure, kl_weight, distance_weight
         )
 
         optimizer.zero_grad()
@@ -129,16 +137,23 @@ def evaluate(
     distance_weight: float,
 ) -> dict:
     """Evaluate on dataset."""
+    import ciffy
+
     embedding.eval()
     vae.eval()
 
     totals = {"loss": 0, "rmsd": 0, "kl": 0, "dist": 0}
+    n = 0
     for s in dataset:
+        # Skip non-RNA chains
+        if not s.polymer.istype(ciffy.RNA):
+            continue
+
         _, metrics = compute_loss(embedding, vae, s, kl_weight, distance_weight)
         for k, v in metrics.items():
             totals[k] += v
+        n += 1
 
-    n = len(dataset)
     return {k: v / n for k, v in totals.items() if v > 0}
 
 
