@@ -21,21 +21,27 @@ class Structure:
     Attributes:
         coords: Normalized coordinates, shape (N, 3).
         coord_scale: Scale factor to recover original coordinates.
+        target_coords: Unnormalized target coordinates for loss computation.
         polymer: Original ciffy Polymer object.
         id: Structure identifier.
+        level: Coordinate level ("atom" or "residue").
     """
     coords: torch.Tensor
     coord_scale: torch.Tensor
+    target_coords: torch.Tensor
     polymer: Any
     id: str
+    level: str
 
     def to(self, device: torch.device) -> Structure:
         """Move tensors to device."""
         return Structure(
             coords=self.coords.to(device),
             coord_scale=self.coord_scale.to(device),
+            target_coords=self.target_coords.to(device),
             polymer=self.polymer.to(device),
             id=self.id,
+            level=self.level,
         )
 
 
@@ -151,26 +157,32 @@ class StructureDataset(Dataset):
 
         # Center coordinates at appropriate level
         if self.level == "residue":
-            polymer, _ = polymer.center(ciffy.RESIDUE)
+            # Use residue centroids as coordinates
+            polymer, centroids = polymer.center(ciffy.RESIDUE)
+            target_coords = centroids.float()
         else:
             polymer, _ = polymer.center()
+            target_coords = polymer.coordinates.float()
 
         # Normalize coordinates
-        coords = polymer.coordinates.float()
-        if coords.shape[0] >= 2:
-            coord_scale = coords.std()
+        if target_coords.shape[0] >= 2:
+            coord_scale = target_coords.std()
             if coord_scale > 0:
-                coords = coords / coord_scale
+                coords = target_coords / coord_scale
             else:
                 coord_scale = torch.tensor(1.0)
+                coords = target_coords
         else:
             coord_scale = torch.tensor(1.0)
+            coords = target_coords
 
         structure = Structure(
             coords=coords,
             coord_scale=coord_scale,
+            target_coords=target_coords,
             polymer=polymer,
             id=polymer.id(),
+            level=self.level,
         )
 
         if self._device is not None:

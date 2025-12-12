@@ -51,10 +51,30 @@ def compute_loss(
     features = embedding(structure.polymer).unsqueeze(-1)
     recon, mu, logvar = vae(structure.coords, features)
 
-    # Reconstruction: aligned RMSD
+    # Reconstruction loss
     coords_pred = recon[:, 0, :] * structure.coord_scale
-    pred_polymer = structure.polymer.with_coordinates(coords_pred)
-    rmsd = ciffy.rmsd(structure.polymer, pred_polymer)
+
+    if structure.level == "atom":
+        # Atom level: use ciffy's aligned RMSD
+        pred_polymer = structure.polymer.with_coordinates(coords_pred)
+        rmsd = ciffy.rmsd(structure.polymer, pred_polymer)
+    else:
+        # Residue level: compute RMSD on centroids directly
+        # Kabsch alignment for optimal rotation
+        target = structure.target_coords
+        pred_centered = coords_pred - coords_pred.mean(dim=0)
+        target_centered = target - target.mean(dim=0)
+
+        # SVD for optimal rotation
+        H = pred_centered.T @ target_centered
+        U, _, Vt = torch.linalg.svd(H)
+        R = Vt.T @ U.T
+        if torch.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = Vt.T @ U.T
+
+        aligned = pred_centered @ R.T
+        rmsd = ((aligned - target_centered) ** 2).sum(dim=-1).mean().sqrt()
 
     # KL divergence
     logvar_exp = logvar.unsqueeze(-1)
@@ -68,8 +88,13 @@ def compute_loss(
 
     # Optional distance matrix loss
     if distance_weight > 0:
-        D_true = structure.polymer.pairwise_distance()
-        D_pred = pred_polymer.pairwise_distance()
+        if structure.level == "atom":
+            D_true = structure.polymer.pairwise_distance()
+            D_pred = pred_polymer.pairwise_distance()
+        else:
+            # Compute pairwise distances on centroids
+            D_true = torch.cdist(structure.target_coords, structure.target_coords)
+            D_pred = torch.cdist(coords_pred, coords_pred)
         dist_loss = (D_pred - D_true).abs().mean()
         loss = loss + distance_weight * dist_loss
         metrics["dist"] = dist_loss.item()
