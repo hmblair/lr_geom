@@ -35,16 +35,16 @@ import torch
 from tqdm import tqdm
 
 # Experiment configurations to compare
-# Fixed k=64, sweep rank=4,8,16, compare node-wise vs edge-wise attention
+# Fixed k=64, sweep rank=2,8,32, compare node-wise vs edge-wise attention
 EXPERIMENT_GRID = [
     # Node-wise attention (Q at node, K/V at edge)
-    {"name": "node_rank4", "k_neighbors": 64, "radial_weight_rank": 4, "attention_type": "node_wise"},
+    {"name": "node_rank2", "k_neighbors": 64, "radial_weight_rank": 2, "attention_type": "node_wise"},
     {"name": "node_rank8", "k_neighbors": 64, "radial_weight_rank": 8, "attention_type": "node_wise"},
-    {"name": "node_rank16", "k_neighbors": 64, "radial_weight_rank": 16, "attention_type": "node_wise"},
+    {"name": "node_rank32", "k_neighbors": 64, "radial_weight_rank": 32, "attention_type": "node_wise"},
     # Edge-wise attention (Q/K/V all at edge)
-    {"name": "edge_rank4", "k_neighbors": 64, "radial_weight_rank": 4, "attention_type": "edge_wise"},
+    {"name": "edge_rank2", "k_neighbors": 64, "radial_weight_rank": 2, "attention_type": "edge_wise"},
     {"name": "edge_rank8", "k_neighbors": 64, "radial_weight_rank": 8, "attention_type": "edge_wise"},
-    {"name": "edge_rank16", "k_neighbors": 64, "radial_weight_rank": 16, "attention_type": "edge_wise"},
+    {"name": "edge_rank32", "k_neighbors": 64, "radial_weight_rank": 32, "attention_type": "edge_wise"},
 ]
 
 
@@ -281,6 +281,12 @@ def compare_results(
 
         try:
             data = torch.load(results_file, map_location="cpu")
+            # Get train RMSD at best epoch
+            best_epoch = data.get("best_epoch", 1)
+            train_history = data.get("history", {}).get("train", [])
+            train_rmsd = None
+            if train_history and best_epoch <= len(train_history):
+                train_rmsd = train_history[best_epoch - 1].get("rmsd")
             results.append({
                 "name": exp["name"],
                 "attn": exp.get("attention_type", "node")[:4],  # "node" or "edge"
@@ -288,9 +294,10 @@ def compare_results(
                 "rank": exp["radial_weight_rank"] or "full",
                 "best_val_loss": data.get("best_val_loss"),
                 "best_val_rmsd": data.get("best_val_rmsd"),
+                "train_rmsd": train_rmsd,
                 "test_rmsd": data.get("test", {}).get("rmsd"),
                 "test_loss": data.get("test", {}).get("loss"),
-                "best_epoch": data.get("best_epoch"),
+                "best_epoch": best_epoch,
                 "avg_epoch_time": data.get("avg_epoch_time"),
             })
         except Exception as e:
@@ -305,26 +312,27 @@ def compare_results(
 
     # Print comparison table
     print()
-    print("=" * 100)
+    print("=" * 115)
     print("EXPERIMENT COMPARISON (RMSD in Angstroms, aligned via Kabsch)")
-    print("=" * 100)
+    print("=" * 115)
     print(
-        f"{'Name':<22} {'Attn':<6} {'k':<5} {'Rank':<6} "
-        f"{'Val RMSD':<10} {'Test RMSD':<10} {'Epoch':<7} {'Time/Ep':<8}"
+        f"{'Name':<18} {'Attn':<6} {'k':<5} {'Rank':<6} "
+        f"{'Train RMSD':<12} {'Val RMSD':<12} {'Test RMSD':<12} {'Epoch':<7} {'Time/Ep':<8}"
     )
-    print("-" * 100)
+    print("-" * 115)
 
     for r in results:
+        train_rmsd = f"{r['train_rmsd']:.2f}Å" if r.get("train_rmsd") else "N/A"
         val_rmsd = f"{r['best_val_rmsd']:.2f}Å" if r.get("best_val_rmsd") else "N/A"
         test_rmsd = f"{r['test_rmsd']:.2f}Å" if r.get("test_rmsd") else "N/A"
         epoch = str(r.get("best_epoch", "N/A"))
         epoch_time = f"{r['avg_epoch_time']:.1f}s" if r.get("avg_epoch_time") else "N/A"
         print(
-            f"{r['name']:<22} {r['attn']:<6} {r['k']:<5} {str(r['rank']):<6} "
-            f"{val_rmsd:<10} {test_rmsd:<10} {epoch:<7} {epoch_time:<8}"
+            f"{r['name']:<18} {r['attn']:<6} {r['k']:<5} {str(r['rank']):<6} "
+            f"{train_rmsd:<12} {val_rmsd:<12} {test_rmsd:<12} {epoch:<7} {epoch_time:<8}"
         )
 
-    print("=" * 100)
+    print("=" * 115)
 
     # Save summary to file
     summary_file = output_path / "comparison_summary.txt"
@@ -338,6 +346,7 @@ def compare_results(
             f.write(f"  attention_type: {r['attn']}\n")
             f.write(f"  k_neighbors: {r['k']}\n")
             f.write(f"  radial_weight_rank: {r['rank']}\n")
+            f.write(f"  train_rmsd: {r.get('train_rmsd')}\n")
             f.write(f"  best_val_rmsd: {r.get('best_val_rmsd')}\n")
             f.write(f"  test_rmsd: {r.get('test_rmsd')}\n")
             f.write(f"  best_val_loss: {r.get('best_val_loss')}\n")
