@@ -87,24 +87,27 @@ def compute_kl_with_free_bits(
     the model to use the latent space rather than ignoring it.
 
     Args:
-        mu: Latent mean, shape (N, latent_dim) or (N, mult, repr_dim).
-        logvar: Latent log-variance, shape matching mu or (N, mult).
+        mu: Latent mean, shape (N, mult, repr_dim).
+        logvar: Latent log-variance, shape (N, mult).
         free_bits: Minimum KL per dimension (lambda in the paper).
 
     Returns:
         Scalar KL divergence loss.
     """
+    # Expand logvar to match mu dimensions: (N, mult) -> (N, mult, 1)
+    logvar_expanded = logvar.unsqueeze(-1)
+
     # Standard KL: -0.5 * (1 + logvar - mu^2 - exp(logvar))
     # Computed per element then summed
-    kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+    kl_per_dim = -0.5 * (1 + logvar_expanded - mu.pow(2) - logvar_expanded.exp())
 
     if free_bits > 0:
         # Apply free bits: max(kl, free_bits) per dimension
         # This ensures each dimension contributes at least free_bits to loss
         kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
 
-    # Sum over latent dimensions, mean over batch
-    return kl_per_dim.sum(dim=-1).mean()
+    # Sum over repr dims and mult, mean over batch
+    return kl_per_dim.sum(dim=(-1, -2)).mean()
 
 
 class WarmupScheduler:
