@@ -219,6 +219,8 @@ class ExperimentManager:
 
     def _run_one(self, name: str, pbar: tqdm) -> None:
         """Run single experiment with GPU from pool."""
+        import traceback
+
         gpu = self._gpu_queue.get()
         try:
             device = torch.device(f"cuda:{gpu}" if gpu >= 0 else "cpu")
@@ -226,10 +228,13 @@ class ExperimentManager:
             with self._lock:
                 self._results[name] = result
         except Exception as e:
+            # Log full traceback for debugging
+            tb = traceback.format_exc()
             with self._lock:
                 self._results[name].status = "failed"
                 self._results[name].error = str(e)
-            raise
+            # Print traceback to help debug
+            print(f"\n[{name}] Error: {e}\n{tb}")
         finally:
             self._gpu_queue.put(gpu)
 
@@ -308,11 +313,12 @@ class ExperimentManager:
         for epoch in range(1, config.training.epochs + 1):
             kl_weight = get_kl_weight(epoch, config)
 
-            # Train
+            # Train (disable inner progress bar)
             train_metrics = train_epoch(
                 embedding, vae, train_data, optimizer,
                 kl_weight, config.training.distance_weight,
                 config.training.grad_clip,
+                progress=False,
             )
             history["train"].append(train_metrics)
 
@@ -344,14 +350,30 @@ class ExperimentManager:
 
             # Update progress bar
             pbar.update(1)
+            best_rmsd = history["val"][best_epoch - 1]["rmsd"] if best_epoch > 0 else float("inf")
             pbar.set_postfix({
                 "rmsd": f"{val_metrics['rmsd']:.2f}Å",
-                "best": f"{history['val'][best_epoch-1]['rmsd']:.2f}Å",
+                "best": f"{best_rmsd:.2f}Å" if best_rmsd < float("inf") else "—",
             })
 
             # Early stopping
             if config.training.early_stopping > 0 and patience >= config.training.early_stopping:
                 break
+
+        # Handle case where no training occurred
+        if best_epoch == 0:
+            return ExperimentResult(
+                name=name,
+                config=config,
+                history=history,
+                best_epoch=0,
+                best_val_loss=float("inf"),
+                best_val_rmsd=float("inf"),
+                test_metrics=None,
+                status="failed",
+                error="No valid training samples (all filtered out)",
+                output_dir=exp_dir,
+            )
 
         # Load best model for test evaluation
         checkpoint = torch.load(exp_dir / "best_model.pt", weights_only=True)
@@ -365,10 +387,11 @@ class ExperimentManager:
         )
 
         # Save final results
+        best_val_rmsd = history["val"][best_epoch - 1]["rmsd"]
         results_dict = {
             "best_epoch": best_epoch,
             "best_val_loss": best_val_loss,
-            "best_val_rmsd": history["val"][best_epoch - 1]["rmsd"],
+            "best_val_rmsd": best_val_rmsd,
             "test": test_metrics,
             "history": history,
         }
@@ -380,7 +403,7 @@ class ExperimentManager:
             history=history,
             best_epoch=best_epoch,
             best_val_loss=best_val_loss,
-            best_val_rmsd=history["val"][best_epoch - 1]["rmsd"],
+            best_val_rmsd=best_val_rmsd,
             test_metrics=test_metrics,
             status="completed",
             output_dir=exp_dir,

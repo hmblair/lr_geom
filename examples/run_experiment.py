@@ -86,6 +86,7 @@ def train_epoch(
     kl_weight: float,
     distance_weight: float,
     grad_clip: float,
+    progress: bool = True,
 ) -> dict:
     """Train for one epoch."""
     import ciffy
@@ -99,12 +100,14 @@ def train_epoch(
     totals = {"loss": 0, "rmsd": 0, "kl": 0, "dist": 0}
     n = 0
 
-    pbar = tqdm(indices, desc="Train", leave=False, ncols=80)
-    for idx in pbar:
+    iterator = tqdm(indices, desc="Train", leave=False, ncols=80) if progress else indices
+    for idx in iterator:
         structure = dataset[idx]
 
-        # Skip non-RNA chains
+        # Skip non-RNA chains and empty structures
         if not structure.polymer.istype(ciffy.RNA):
+            continue
+        if structure.coords.shape[0] < 3:
             continue
 
         loss, metrics = compute_loss(
@@ -123,8 +126,11 @@ def train_epoch(
         for k, v in metrics.items():
             totals[k] += v
         n += 1
-        pbar.set_postfix({"rmsd": f"{totals['rmsd']/n:.2f}Å"})
+        if progress:
+            iterator.set_postfix({"rmsd": f"{totals['rmsd']/n:.2f}Å"})
 
+    if n == 0:
+        return {"loss": 0, "rmsd": 0, "kl": 0}
     return {k: v / n for k, v in totals.items() if v > 0}
 
 
@@ -145,8 +151,10 @@ def evaluate(
     totals = {"loss": 0, "rmsd": 0, "kl": 0, "dist": 0}
     n = 0
     for s in dataset:
-        # Skip non-RNA chains
+        # Skip non-RNA chains and empty structures
         if not s.polymer.istype(ciffy.RNA):
+            continue
+        if s.coords.shape[0] < 3:
             continue
 
         _, metrics = compute_loss(embedding, vae, s, kl_weight, distance_weight)
@@ -154,6 +162,8 @@ def evaluate(
             totals[k] += v
         n += 1
 
+    if n == 0:
+        return {"loss": 0, "rmsd": 0, "kl": 0}
     return {k: v / n for k, v in totals.items() if v > 0}
 
 
