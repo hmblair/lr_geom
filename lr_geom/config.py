@@ -198,6 +198,9 @@ class DataConfig:
         train_split: Fraction of data for training.
         val_split: Fraction of data for validation.
         seed: Random seed for data splitting.
+        residue_level: If True, use residue centers instead of all atoms.
+            Features will be residue embeddings (from polymer.sequence)
+            instead of atom embeddings.
     """
 
     data_dir: str = ""
@@ -207,6 +210,7 @@ class DataConfig:
     train_split: float = 0.8
     val_split: float = 0.1
     seed: int = 42
+    residue_level: bool = False
 
     def __post_init__(self) -> None:
         """Validate configuration values."""

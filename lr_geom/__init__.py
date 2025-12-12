@@ -16,6 +16,8 @@ Modules:
     models: Pre-built geometric models (GNM functions)
     vae: SO(3)-equivariant variational autoencoder
     config: Configuration system for experiments
+    data: Structure loading and dataset utilities
+    training: Training utilities (Trainer, callbacks, metrics)
 
 Optional Dependencies:
     - sphericart: Required for SphericalHarmonic
@@ -93,6 +95,12 @@ from .config import (
     save_config,
 )
 
+# Data loading
+from .data import (
+    Structure,
+    StructureDataset,
+)
+
 # Training system (imported separately to avoid circular imports)
 # Access via: from lr_geom.training import Trainer, ModelCheckpoint, etc.
 # or: import lr_geom; lg.training.Trainer
@@ -143,4 +151,7 @@ __all__ = [
     "ExperimentConfig",
     "load_config",
     "save_config",
+    # Data loading
+    "Structure",
+    "StructureDataset",
 ]

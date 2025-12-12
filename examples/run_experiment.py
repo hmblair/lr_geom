@@ -35,6 +35,7 @@ from lr_geom.config import (
     save_config,
     merge_config_with_args,
 )
+from lr_geom.data import StructureDataset, Structure
 from lr_geom.vae import EquivariantVAE, kl_divergence
 from lr_geom.training import set_seed, get_device
 
@@ -209,78 +210,12 @@ def build_model_from_config(
     return embedding, vae
 
 
-def load_structures(
-    config: DataConfig,
-    device: torch.device,
-) -> list[dict]:
-    """Load structure data.
-
-    Args:
-        config: Data configuration.
-        device: Device to place tensors on.
-
-    Returns:
-        List of structure dictionaries.
-    """
-    try:
-        import ciffy
-    except ImportError:
-        raise ImportError(
-            "ciffy is required for loading structure data. "
-            "Install from: https://github.com/your/ciffy"
-        )
-
-    data_dir = Path(config.data_dir).expanduser()
-    if not data_dir.exists():
-        raise FileNotFoundError(f"Data directory not found: {data_dir}")
-
-    structures = []
-    cif_files = sorted(data_dir.glob("*.cif"))
-
-    print(f"Loading structures from {data_dir}")
-    print(f"Found {len(cif_files)} CIF files")
-
-    for cif_file in cif_files:
-        try:
-            polymer = ciffy.load(str(cif_file), backend="torch")
-            n_atoms = polymer.size()
-
-            # Filter by size
-            if n_atoms < config.min_atoms or n_atoms > config.max_atoms:
-                continue
-
-            # Center and normalize
-            polymer, _ = polymer.center()
-            coords = polymer.coordinates.float()
-            coord_scale = coords.std()
-            coords_normalized = coords / coord_scale
-
-            structures.append({
-                "coords": coords_normalized.to(device),
-                "coord_scale": coord_scale.to(device),
-                "atoms": polymer.atoms.long().to(device).clamp(min=0),
-                "id": polymer.id(),
-                "polymer": polymer.to(device),  # Keep for ciffy.rmsd
-            })
-
-            if config.num_structures and len(structures) >= config.num_structures:
-                break
-
-        except Exception as e:
-            print(f"  Warning: Could not load {cif_file.name}: {e}")
-            continue
-
-    print(f"Loaded {len(structures)} structures")
-    return structures
-
-
 def train_epoch(
     embedding: nn.Embedding,
     vae: EquivariantVAE,
-    structures: list[dict],
+    dataset: StructureDataset,
     optimizer: optim.Optimizer,
     config: TrainingConfig,
-    device: torch.device,
     kl_weight: float | None = None,
 ) -> dict:
     """Train for one epoch.
@@ -288,10 +223,9 @@ def train_epoch(
     Args:
         embedding: Atom embedding module.
         vae: VAE model.
-        structures: List of structure data.
+        dataset: Training dataset.
         optimizer: Optimizer.
         config: Training configuration.
-        device: Device.
         kl_weight: Override KL weight for this epoch (for annealing).
 
     Returns:
@@ -314,26 +248,22 @@ def train_epoch(
     epoch_start = time.time()
 
     # Shuffle structures
-    indices = list(range(len(structures)))
+    indices = list(range(len(dataset)))
     random.shuffle(indices)
 
     pbar = tqdm(indices, desc="Training", leave=False, ncols=80)
     for idx in pbar:
-        s = structures[idx]
-        coords = s["coords"]
-        atoms = s["atoms"]
-        coord_scale = s["coord_scale"]
-        polymer = s["polymer"]
+        s = dataset[idx]
 
         # Forward pass
-        features = embedding(atoms).unsqueeze(-1)
-        recon, mu, logvar = vae(coords, features)
+        features = embedding(s.features).unsqueeze(-1)
+        recon, mu, logvar = vae(s.coords, features)
 
         # Compute aligned RMSD loss using ciffy (differentiable)
         coords_pred = recon[:, 0, :]
-        coords_pred_unnorm = coords_pred * coord_scale
-        pred_polymer = polymer.with_coordinates(coords_pred_unnorm)
-        rmsd_loss = ciffy.rmsd(polymer, pred_polymer)
+        coords_pred_unnorm = coords_pred * s.coord_scale
+        pred_polymer = s.polymer.with_coordinates(coords_pred_unnorm)
+        rmsd_loss = ciffy.rmsd(s.polymer, pred_polymer)
 
         # KL loss with optional free bits
         kl_loss = compute_kl_with_free_bits(mu, logvar, config.free_bits)
@@ -372,7 +302,7 @@ def train_epoch(
 def evaluate(
     embedding: nn.Embedding,
     vae: EquivariantVAE,
-    structures: list[dict],
+    dataset: StructureDataset,
     config: TrainingConfig,
     kl_weight: float | None = None,
 ) -> dict:
@@ -381,7 +311,7 @@ def evaluate(
     Args:
         embedding: Atom embedding module.
         vae: VAE model.
-        structures: List of structure data.
+        dataset: Evaluation dataset.
         config: Training configuration.
         kl_weight: Override KL weight (for consistency with training).
 
@@ -401,20 +331,15 @@ def evaluate(
     total_kl = 0.0
 
     with torch.no_grad():
-        for s in structures:
-            coords = s["coords"]
-            atoms = s["atoms"]
-            coord_scale = s["coord_scale"]
-            polymer = s["polymer"]
-
-            features = embedding(atoms).unsqueeze(-1)
-            recon, mu, logvar = vae(coords, features)
+        for s in dataset:
+            features = embedding(s.features).unsqueeze(-1)
+            recon, mu, logvar = vae(s.coords, features)
 
             # Compute aligned RMSD using ciffy
             coords_pred = recon[:, 0, :]
-            coords_pred_unnorm = coords_pred * coord_scale
-            pred_polymer = polymer.with_coordinates(coords_pred_unnorm)
-            rmsd = ciffy.rmsd(polymer, pred_polymer)
+            coords_pred_unnorm = coords_pred * s.coord_scale
+            pred_polymer = s.polymer.with_coordinates(coords_pred_unnorm)
+            rmsd = ciffy.rmsd(s.polymer, pred_polymer)
 
             # KL loss with optional free bits
             kl_loss = compute_kl_with_free_bits(mu, logvar, config.free_bits)
@@ -424,7 +349,7 @@ def evaluate(
             total_rmsd += rmsd.item()
             total_kl += kl_loss.item()
 
-    n = len(structures)
+    n = len(dataset)
     return {
         "loss": total_loss / n,
         "rmsd": total_rmsd / n,
@@ -435,7 +360,7 @@ def evaluate(
 def save_reconstructions(
     embedding: nn.Embedding,
     vae: EquivariantVAE,
-    structures: list[dict],
+    dataset: StructureDataset,
     output_dir: Path,
     num_samples: int = 3,
 ) -> list[str]:
@@ -449,7 +374,7 @@ def save_reconstructions(
     Args:
         embedding: Atom embedding module.
         vae: VAE model.
-        structures: List of structure data.
+        dataset: Dataset of structures.
         output_dir: Directory to save .cif files.
         num_samples: Number of samples to save.
 
@@ -463,48 +388,43 @@ def save_reconstructions(
     recon_dir.mkdir(parents=True, exist_ok=True)
 
     saved_ids = []
-    n_to_save = min(num_samples, len(structures))
+    n_to_save = min(num_samples, len(dataset))
 
     with torch.no_grad():
         for i in range(n_to_save):
-            s = structures[i]
-            coords = s["coords"]
-            atoms = s["atoms"]
-            coord_scale = s["coord_scale"]
-            polymer = s["polymer"]
-            struct_id = s["id"]
+            s = dataset[i]
 
             # Get features (conditioning)
-            features = embedding(atoms).unsqueeze(-1)
+            features = embedding(s.features).unsqueeze(-1)
 
             # Reconstruction: encode -> decode
-            recon, _, _ = vae(coords, features)
+            recon, _, _ = vae(s.coords, features)
             coords_recon = recon[:, 0, :]
-            coords_recon_unnorm = coords_recon * coord_scale
+            coords_recon_unnorm = coords_recon * s.coord_scale
 
             # Sample: random z from prior + conditioning -> decode
-            sampled = vae.sample(coords, features)
+            sampled = vae.sample(s.coords, features)
             coords_sampled = sampled[:, 0, :]
-            coords_sampled_unnorm = coords_sampled * coord_scale
+            coords_sampled_unnorm = coords_sampled * s.coord_scale
 
             # Create polymers
-            recon_polymer = polymer.with_coordinates(coords_recon_unnorm)
-            sampled_polymer = polymer.with_coordinates(coords_sampled_unnorm)
+            recon_polymer = s.polymer.with_coordinates(coords_recon_unnorm)
+            sampled_polymer = s.polymer.with_coordinates(coords_sampled_unnorm)
 
             # Save structures
-            safe_id = struct_id.replace("/", "_").replace(" ", "_")
+            safe_id = s.id.replace("/", "_").replace(" ", "_")
             original_path = recon_dir / f"{safe_id}_original.cif"
             recon_path = recon_dir / f"{safe_id}_reconstructed.cif"
             sampled_path = recon_dir / f"{safe_id}_sampled.cif"
 
             try:
-                polymer.write(str(original_path))
+                s.polymer.write(str(original_path))
                 recon_polymer.write(str(recon_path))
                 sampled_polymer.write(str(sampled_path))
-                saved_ids.append(struct_id)
-                print(f"  Saved reconstruction and sample for {struct_id}")
+                saved_ids.append(s.id)
+                print(f"  Saved reconstruction and sample for {s.id}")
             except Exception as e:
-                print(f"  Warning: Could not save {struct_id}: {e}")
+                print(f"  Warning: Could not save {s.id}: {e}")
 
     return saved_ids
 
@@ -538,36 +458,34 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
     print(f"Config saved to: {output_dir / 'config.yaml'}")
 
     # Load data
-    try:
-        import ciffy
-        num_atom_types = ciffy.NUM_ATOMS
-    except ImportError:
-        num_atom_types = 128  # Default fallback
+    level = "residue" if config.data.residue_level else "atom"
+    dataset = StructureDataset.from_directory(
+        config.data.data_dir,
+        level=level,
+        min_nodes=config.data.min_atoms,
+        max_nodes=config.data.max_atoms,
+        max_structures=config.data.num_structures,
+    )
 
-    structures = load_structures(config.data, device)
-
-    if not structures:
+    if len(dataset) == 0:
         print("No structures loaded! Check data directory.")
         return {"error": "No data"}
 
-    # Split data
-    n = len(structures)
-    n_train = int(n * config.data.train_split)
-    n_val = int(n * config.data.val_split)
+    # Split data and move to device
+    train_data, val_data, test_data = dataset.split(
+        train=config.data.train_split,
+        val=config.data.val_split,
+        seed=config.data.seed,
+    )
+    train_data = train_data.to(device)
+    val_data = val_data.to(device)
+    test_data = test_data.to(device)
 
-    random.seed(config.data.seed)
-    indices = list(range(n))
-    random.shuffle(indices)
-
-    train_structures = [structures[i] for i in indices[:n_train]]
-    val_structures = [structures[i] for i in indices[n_train:n_train + n_val]]
-    test_structures = [structures[i] for i in indices[n_train + n_val:]]
-
-    print(f"Train: {len(train_structures)}, Val: {len(val_structures)}, Test: {len(test_structures)}")
+    print(f"Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
     print()
 
     # Build model
-    embedding, vae = build_model_from_config(config.model, num_atom_types, device)
+    embedding, vae = build_model_from_config(config.model, dataset.num_feature_types, device)
 
     num_params = sum(p.numel() for p in embedding.parameters()) + sum(p.numel() for p in vae.parameters())
     print(f"Model parameters: {num_params:,}")
@@ -586,17 +504,15 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
 
         with torch.no_grad():
             # Run one forward pass with first training structure
-            s = train_structures[0]
-            coords = s["coords"].to(device)
-            atoms = s["atoms"].to(device)
-            features = embedding(atoms).unsqueeze(-1)
-            recon, mu, logvar = vae(coords, features)
+            s = train_data[0]
+            features = embedding(s.features).unsqueeze(-1)
+            recon, mu, logvar = vae(s.coords, features)
 
             # Also test sampling
-            sampled = vae.sample(coords, features)
+            sampled = vae.sample(s.coords, features)
 
             print(f"Forward pass: OK")
-            print(f"  Input coords: {coords.shape}")
+            print(f"  Input coords: {s.coords.shape}")
             print(f"  Features: {features.shape}")
             print(f"  Reconstruction: {recon.shape}")
             print(f"  Latent mu: {mu.shape}")
@@ -604,18 +520,18 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
             print()
 
         # Evaluate on test set (with untrained model)
-        if test_structures:
+        if len(test_data) > 0:
             print("Evaluating on test set (untrained model)...")
-            test_metrics = evaluate(embedding, vae, test_structures, config.training)
+            test_metrics = evaluate(embedding, vae, test_data, config.training)
             print(f"  Test RMSD: {test_metrics['rmsd']:.2f}Å")
             print(f"  Test Loss: {test_metrics['loss']:.4f}")
             print()
 
         # Save reconstructions and samples
-        if test_structures and num_recon_samples > 0:
+        if len(test_data) > 0 and num_recon_samples > 0:
             print(f"Saving {num_recon_samples} reconstructions and samples...")
             saved_ids = save_reconstructions(
-                embedding, vae, test_structures, output_dir, num_recon_samples
+                embedding, vae, test_data, output_dir, num_recon_samples
             )
             print(f"  Saved {len(saved_ids)} structures to: {output_dir / 'reconstructions'}")
             print()
@@ -679,14 +595,14 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
 
         # Train
         train_metrics = train_epoch(
-            embedding, vae, train_structures, optimizer, config.training, device,
+            embedding, vae, train_data, optimizer, config.training,
             kl_weight=current_kl_weight,
         )
         history["train"].append(train_metrics)
 
         # Validate
-        if val_structures:
-            val_metrics = evaluate(embedding, vae, val_structures, config.training,
+        if len(val_data) > 0:
+            val_metrics = evaluate(embedding, vae, val_data, config.training,
                                    kl_weight=current_kl_weight)
             history["val"].append(val_metrics)
             val_loss = val_metrics["loss"]
@@ -771,8 +687,8 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
         "avg_epoch_time": avg_epoch_time,
     }
 
-    if test_structures:
-        test_metrics = evaluate(embedding, vae, test_structures, config.training)
+    if len(test_data) > 0:
+        test_metrics = evaluate(embedding, vae, test_data, config.training)
         results["test"] = test_metrics
         print(f"Test RMSD: {test_metrics['rmsd']:.2f}Å")
         print(f"Test Loss: {test_metrics['loss']:.4f}")
@@ -782,7 +698,7 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
         print()
         print("Saving reconstructions...")
         saved_ids = save_reconstructions(
-            embedding, vae, test_structures, output_dir, num_samples=num_recon_samples
+            embedding, vae, test_data, output_dir, num_samples=num_recon_samples
         )
         if saved_ids:
             results["reconstruction_ids"] = saved_ids
@@ -831,6 +747,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, help="Output directory")
     parser.add_argument("--data_dir", type=str, help="Data directory")
     parser.add_argument("--num_structures", type=int, help="Max structures to load")
+    parser.add_argument("--residue_level", action="store_true", help="Use residue centers instead of atoms")
     parser.add_argument("--device", type=str, help="Device (cuda, cpu, auto)")
     parser.add_argument("--seed", type=int, help="Random seed")
     parser.add_argument("--num_recon_samples", type=int, default=3, help="Number of test samples to save reconstructions for")

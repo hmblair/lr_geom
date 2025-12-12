@@ -464,6 +464,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="KL weight",
     )
+    parser.add_argument(
+        "--residue_level",
+        action="store_true",
+        help="Use residue centers instead of atoms",
+    )
 
     return parser.parse_args()
 
@@ -513,6 +518,8 @@ def main():
         extra_args.extend(["--warmup_epochs", str(args.warmup_epochs)])
     if args.kl_weight is not None:
         extra_args.extend(["--kl_weight", str(args.kl_weight)])
+    if args.residue_level:
+        extra_args.append("--residue_level")
 
     # Verify base config exists
     if not Path(args.config).exists():
@@ -521,15 +528,24 @@ def main():
         # Will proceed anyway, run_experiment.py will use defaults
         print()
 
-    # Run experiments
-    print("Experiments to run:")
+    # Copy experiment grid and modify names if residue_level
+    experiments = []
     for exp in EXPERIMENT_GRID:
+        exp_copy = exp.copy()
+        if args.residue_level:
+            exp_copy["name"] = f"res_{exp['name']}"
+        experiments.append(exp_copy)
+
+    # Run experiments
+    level_str = "residue-level" if args.residue_level else "atom-level"
+    print(f"Experiments to run ({level_str}):")
+    for exp in experiments:
         rank_str = exp["radial_weight_rank"] or "full"
         print(f"  - {exp['name']}: k={exp['k_neighbors']}, rank={rank_str}")
     print()
 
     results = run_all_experiments(
-        EXPERIMENT_GRID,
+        experiments,
         gpus,
         args.config,
         str(output_dir),
@@ -561,7 +577,7 @@ def main():
         # Small delay to ensure files are flushed
         import time
         time.sleep(2)
-        compare_results(str(output_dir), EXPERIMENT_GRID)
+        compare_results(str(output_dir), experiments)
 
 
 if __name__ == "__main__":
