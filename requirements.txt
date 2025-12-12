@@ -1,0 +1,10 @@
+# Core dependencies
+numpy
+torch>=2.0
+
+# Spherical harmonics (required for full functionality)
+sphericart[torch]
+
+# Testing
+pytest
+scipy
