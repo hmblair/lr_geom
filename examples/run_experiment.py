@@ -465,9 +465,11 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
 
     # Dry run: validate setup without training
     if dry_run:
-        print("DRY RUN: Validating setup...")
+        print("DRY RUN: Validating setup (mirroring full experiment flow)...")
+        print()
         embedding.eval()
         vae.eval()
+
         with torch.no_grad():
             # Run one forward pass with first training structure
             s = train_structures[0]
@@ -479,14 +481,34 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
             # Also test sampling
             sampled = vae.sample(coords, features)
 
-            print(f"  Forward pass: OK")
-            print(f"    Input coords: {coords.shape}")
-            print(f"    Features: {features.shape}")
-            print(f"    Reconstruction: {recon.shape}")
-            print(f"    Latent mu: {mu.shape}")
-            print(f"    Sample: {sampled.shape}")
+            print(f"Forward pass: OK")
+            print(f"  Input coords: {coords.shape}")
+            print(f"  Features: {features.shape}")
+            print(f"  Reconstruction: {recon.shape}")
+            print(f"  Latent mu: {mu.shape}")
+            print(f"  Sample: {sampled.shape}")
             print()
-            print("DRY RUN: Setup validated successfully!")
+
+        # Evaluate on test set (with untrained model)
+        if test_structures:
+            print("Evaluating on test set (untrained model)...")
+            test_metrics = evaluate(embedding, vae, test_structures, config.training)
+            print(f"  Test RMSD: {test_metrics['rmsd']:.2f}Å")
+            print(f"  Test Loss: {test_metrics['loss']:.4f}")
+            print()
+
+        # Save reconstructions and samples
+        if test_structures and num_recon_samples > 0:
+            print(f"Saving {num_recon_samples} reconstructions and samples...")
+            saved_ids = save_reconstructions(
+                embedding, vae, test_structures, output_dir, num_recon_samples
+            )
+            print(f"  Saved {len(saved_ids)} structures to: {output_dir / 'reconstructions'}")
+            print()
+
+        print("=" * 60)
+        print("DRY RUN COMPLETE: Setup validated successfully!")
+        print("=" * 60)
 
         return {"dry_run": True, "status": "success"}
 
