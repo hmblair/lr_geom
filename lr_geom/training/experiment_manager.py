@@ -223,6 +223,9 @@ class ExperimentManager:
 
         gpu = self._gpu_queue.get()
         try:
+            # Set CUDA device for this thread
+            if gpu >= 0 and torch.cuda.is_available():
+                torch.cuda.set_device(gpu)
             device = torch.device(f"cuda:{gpu}" if gpu >= 0 else "cpu")
             result = self._train(name, device, pbar)
             with self._lock:
