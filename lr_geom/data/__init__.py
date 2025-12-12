@@ -4,30 +4,25 @@ This module provides a clean abstraction for loading molecular structures
 into a format suitable for training geometric neural networks.
 
 Classes:
-    Structure: A single structure with coords, features, and metadata.
+    Structure: A single structure with coords, polymer, and metadata.
     StructureDataset: Dataset of structures with train/val/test splitting.
 
 Example:
     from lr_geom.data import StructureDataset
+    from ciffy.nn import PolymerEmbedding
 
-    # Load atom-level structures
-    dataset = StructureDataset.from_directory(
-        "~/data/pdb130",
-        level="atom",
-        min_nodes=20,
-        max_nodes=500,
-    )
-
-    # Load residue-level structures
+    # Load RNA structures at residue level
     dataset = StructureDataset.from_directory(
         "~/data/pdb130",
         level="residue",
+        molecule_type="rna",
     )
 
     # Split and use
     train, val, test = dataset.split()
+    embedding = PolymerEmbedding(scale=ciffy.RESIDUE, residue_dim=64)
     for structure in train:
-        coords, features = structure.coords, structure.features
+        features = embedding(structure.polymer)
 """
 from lr_geom.data.dataset import Structure, StructureDataset
 

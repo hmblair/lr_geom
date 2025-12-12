@@ -20,13 +20,11 @@ class Structure:
 
     Attributes:
         coords: Normalized coordinates, shape (N, 3).
-        features: Feature indices for embedding lookup, shape (N,).
         coord_scale: Scale factor to recover original coordinates.
         polymer: Original ciffy Polymer object.
         id: Structure identifier.
     """
     coords: torch.Tensor
-    features: torch.Tensor
     coord_scale: torch.Tensor
     polymer: Any
     id: str
@@ -35,7 +33,6 @@ class Structure:
         """Move tensors to device."""
         return Structure(
             coords=self.coords.to(device),
-            features=self.features.to(device),
             coord_scale=self.coord_scale.to(device),
             polymer=self.polymer.to(device),
             id=self.id,
@@ -155,12 +152,8 @@ class StructureDataset(Dataset):
         # Center coordinates at appropriate level
         if self.level == "residue":
             polymer, _ = polymer.center(ciffy.RESIDUE)
-            features = polymer.sequence
-            max_idx = ciffy.NUM_RESIDUES - 1
         else:
             polymer, _ = polymer.center()
-            features = polymer.atoms
-            max_idx = ciffy.NUM_ATOMS - 1
 
         # Normalize coordinates
         coords = polymer.coordinates.float()
@@ -175,7 +168,6 @@ class StructureDataset(Dataset):
 
         structure = Structure(
             coords=coords,
-            features=features.long().clamp(0, max_idx),
             coord_scale=coord_scale,
             polymer=polymer,
             id=polymer.id(),

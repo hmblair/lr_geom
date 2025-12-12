@@ -101,7 +101,7 @@ def _run_experiment_process(
         test_data = test_data.to(device)
 
         # Build model
-        embedding, vae = build_model(config, dataset.num_feature_types, device)
+        embedding, vae = build_model(config, device)
 
         # Setup optimizer and scheduler
         params = list(embedding.parameters()) + list(vae.parameters())

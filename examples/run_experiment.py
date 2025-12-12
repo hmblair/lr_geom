@@ -34,7 +34,7 @@ from lr_geom.training import set_seed, get_device
 
 
 def compute_loss(
-    embedding: nn.Embedding,
+    embedding: nn.Module,
     vae: lg.EquivariantVAE,
     structure,
     kl_weight: float,
@@ -48,7 +48,7 @@ def compute_loss(
     import ciffy
 
     # Forward pass
-    features = embedding(structure.features).unsqueeze(-1)
+    features = embedding(structure.polymer).unsqueeze(-1)
     recon, mu, logvar = vae(structure.coords, features)
 
     # Reconstruction: aligned RMSD
@@ -159,8 +159,11 @@ def evaluate(
     return {k: v / n for k, v in totals.items() if v > 0}
 
 
-def build_model(config, num_feature_types: int, device: torch.device):
+def build_model(config, device: torch.device):
     """Build embedding and VAE from config."""
+    import ciffy
+    from ciffy.nn import PolymerEmbedding
+
     lvals_hidden = list(range(config.model.lmax_hidden + 1))
     lvals_latent = list(range(config.model.lmax_latent + 1))
 
@@ -169,7 +172,17 @@ def build_model(config, num_feature_types: int, device: torch.device):
     latent_repr = lg.Repr(lvals_latent, mult=config.model.latent_mult)
     out_repr = lg.Repr([1], mult=1)
 
-    embedding = nn.Embedding(num_feature_types, config.model.embed_dim).to(device)
+    # Use ciffy's PolymerEmbedding
+    if config.data.residue_level:
+        embedding = PolymerEmbedding(
+            scale=ciffy.RESIDUE,
+            residue_dim=config.model.embed_dim,
+        ).to(device)
+    else:
+        embedding = PolymerEmbedding(
+            scale=ciffy.ATOM,
+            atom_dim=config.model.embed_dim,
+        ).to(device)
 
     vae = lg.EquivariantVAE(
         in_repr=in_repr,
@@ -254,7 +267,7 @@ def run_experiment(config: ExperimentConfig) -> dict:
 
     # Build model
     t0 = time.time()
-    embedding, vae = build_model(config, dataset.num_feature_types, device)
+    embedding, vae = build_model(config, device)
     print(f"Model built in {time.time() - t0:.1f}s")
 
     n_params = sum(p.numel() for p in embedding.parameters()) + \
