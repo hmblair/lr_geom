@@ -241,6 +241,7 @@ def run_experiment(config: ExperimentConfig) -> dict:
         scale="chain",  # iterate over chains
         level=level,
         max_atoms=config.data.max_atoms,
+        num_structures=config.data.num_structures,
     )
     print(f"Data scanned in {time.time() - t0:.1f}s")
 

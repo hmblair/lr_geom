@@ -42,6 +42,7 @@ def main():
     parser.add_argument("--kl_weight", type=float)
     parser.add_argument("--distance_weight", type=float)
     parser.add_argument("--sequential", action="store_true", help="Run experiments sequentially")
+    parser.add_argument("--max_structures", type=int, help="Maximum number of structures to load")
     args = parser.parse_args()
 
     # Parse GPUs
@@ -61,6 +62,8 @@ def main():
         config.training.distance_weight = args.distance_weight
     if args.no_compile:
         config.model.use_compile = False
+    if args.max_structures is not None:
+        config.data.num_structures = args.max_structures
 
     # Create manager
     manager = ExperimentManager(

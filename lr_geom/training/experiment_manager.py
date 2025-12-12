@@ -87,6 +87,7 @@ def _run_experiment_process(
             scale="chain",
             level=level,
             max_atoms=config.data.max_atoms,
+            num_structures=config.data.num_structures,
         )
 
         # Split and move to device

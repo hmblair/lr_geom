@@ -84,6 +84,7 @@ class StructureDataset(Dataset):
         scale: Literal["molecule", "chain"] = "chain",
         level: Literal["atom", "residue"] = "atom",
         max_atoms: int | None = None,
+        num_structures: int | None = None,
         device: torch.device | None = None,
     ) -> StructureDataset:
         """Create dataset from directory of CIF files.
@@ -97,6 +98,7 @@ class StructureDataset(Dataset):
                 - "atom": use atom type indices
                 - "residue": use residue type indices
             max_atoms: Maximum atoms per item (filtered out if exceeded).
+            num_structures: Maximum number of structures to load (None for all).
             device: Device for tensors.
 
         Returns:
@@ -112,6 +114,7 @@ class StructureDataset(Dataset):
             directory=path,
             scale=scale_enum,
             max_atoms=max_atoms,
+            num_structures=num_structures,
             backend="torch",
         )
         print(f"Found {len(ciffy_dataset)} items")
