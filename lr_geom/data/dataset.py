@@ -1,12 +1,14 @@
-"""Structure dataset for geometric deep learning.
+"""Structure dataset using ciffy's PolymerDataset.
 
-Simple, straightforward data loading. No lazy loading complexity.
+Wraps ciffy.nn.PolymerDataset to provide normalized coordinates
+and feature indices for geometric deep learning.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Literal, Any
+import random
 
 import torch
 from torch.utils.data import Dataset
@@ -14,13 +16,13 @@ from torch.utils.data import Dataset
 
 @dataclass
 class Structure:
-    """A molecular structure for geometric deep learning.
+    """A molecular structure ready for geometric deep learning.
 
     Attributes:
         coords: Normalized coordinates, shape (N, 3).
-        features: Node feature indices for embedding lookup, shape (N,).
+        features: Feature indices for embedding lookup, shape (N,).
         coord_scale: Scale factor to recover original coordinates.
-        polymer: Original ciffy polymer object.
+        polymer: Original ciffy Polymer object.
         id: Structure identifier.
     """
     coords: torch.Tensor
@@ -41,84 +43,98 @@ class Structure:
 
 
 class StructureDataset(Dataset):
-    """Simple dataset for molecular structures.
+    """Dataset for molecular structures using ciffy.
+
+    Uses ciffy.nn.PolymerDataset for efficient loading with optional
+    chain-level iteration.
 
     Example:
-        dataset = StructureDataset.from_directory("/path/to/cifs")
+        dataset = StructureDataset.from_directory(
+            "/path/to/cifs",
+            scale="chain",  # iterate over chains
+            level="residue",  # residue-level features
+            max_atoms=1000,
+        )
         train, val, test = dataset.split()
-        train = train.to(device)
         for structure in train:
-            ...
+            coords, features = structure.coords, structure.features
     """
 
     def __init__(
         self,
-        structures: list[Structure],
+        ciffy_dataset,
         level: Literal["atom", "residue"] = "atom",
+        device: torch.device | None = None,
     ):
-        self.structures = structures
+        """Initialize with a ciffy PolymerDataset.
+
+        Args:
+            ciffy_dataset: A ciffy.nn.PolymerDataset instance.
+            level: Feature level ("atom" or "residue").
+            device: Device to place tensors on.
+        """
+        self._dataset = ciffy_dataset
         self.level = level
-        self._device = None
+        self._device = device
 
     @classmethod
     def from_directory(
         cls,
         path: str | Path,
+        scale: Literal["molecule", "chain"] = "chain",
         level: Literal["atom", "residue"] = "atom",
-        max_structures: int | None = None,
-        verbose: bool = True,
+        max_atoms: int | None = None,
+        device: torch.device | None = None,
     ) -> StructureDataset:
-        """Load structures from a directory of CIF files.
+        """Create dataset from directory of CIF files.
 
         Args:
             path: Directory containing .cif files.
-            level: "atom" or "residue" level representation.
-            max_structures: Maximum number to load (None for all).
-            verbose: Print progress.
+            scale: Iteration scale:
+                - "molecule": iterate over full structures
+                - "chain": iterate over individual chains (recommended)
+            level: Feature level:
+                - "atom": use atom type indices
+                - "residue": use residue type indices
+            max_atoms: Maximum atoms per item (filtered out if exceeded).
+            device: Device for tensors.
 
         Returns:
-            StructureDataset with loaded structures.
+            StructureDataset instance.
         """
-        try:
-            import ciffy
-        except ImportError:
-            raise ImportError(
-                "ciffy is required. Install from: https://github.com/hmblair/ciffy"
-            )
+        import ciffy
+        from ciffy.nn import PolymerDataset
 
-        path = Path(path).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(f"Directory not found: {path}")
+        scale_enum = ciffy.CHAIN if scale == "chain" else ciffy.MOLECULE
 
-        cif_files = sorted(path.glob("*.cif"))
-        if max_structures:
-            cif_files = cif_files[:max_structures]
+        print(f"Scanning {path} (scale={scale}, level={level}, max_atoms={max_atoms})")
+        ciffy_dataset = PolymerDataset(
+            directory=path,
+            scale=scale_enum,
+            max_atoms=max_atoms,
+            backend="torch",
+        )
+        print(f"Found {len(ciffy_dataset)} items")
 
-        if verbose:
-            print(f"Loading {len(cif_files)} structures from {path} ({level}-level)")
+        return cls(ciffy_dataset, level=level, device=device)
 
-        structures = []
-        for cif_file in cif_files:
-            try:
-                s = cls._load_one(cif_file, level)
-                structures.append(s)
-            except Exception as e:
-                if verbose:
-                    print(f"  Skipping {cif_file.name}: {e}")
+    @property
+    def num_feature_types(self) -> int:
+        """Number of feature types for embedding table."""
+        import ciffy
+        return ciffy.NUM_RESIDUES if self.level == "residue" else ciffy.NUM_ATOMS
 
-        if verbose:
-            print(f"Loaded {len(structures)} structures")
+    def __len__(self) -> int:
+        return len(self._dataset)
 
-        return cls(structures, level=level)
-
-    @staticmethod
-    def _load_one(path: Path, level: str) -> Structure:
-        """Load a single structure from CIF file."""
+    def __getitem__(self, idx: int) -> Structure:
+        """Get structure at index."""
         import ciffy
 
-        polymer = ciffy.load(str(path), backend="torch")
+        polymer = self._dataset[idx]
 
-        if level == "residue":
+        # Center coordinates at appropriate level
+        if self.level == "residue":
             polymer, _ = polymer.center(ciffy.RESIDUE)
             features = polymer.sequence
             max_idx = ciffy.NUM_RESIDUES - 1
@@ -127,44 +143,34 @@ class StructureDataset(Dataset):
             features = polymer.atoms
             max_idx = ciffy.NUM_ATOMS - 1
 
+        # Normalize coordinates
         coords = polymer.coordinates.float()
         coord_scale = coords.std()
-        coords_norm = coords / coord_scale
+        if coord_scale > 0:
+            coords = coords / coord_scale
+        else:
+            coord_scale = torch.tensor(1.0)
 
-        return Structure(
-            coords=coords_norm,
+        structure = Structure(
+            coords=coords,
             features=features.long().clamp(0, max_idx),
             coord_scale=coord_scale,
             polymer=polymer,
             id=polymer.id(),
         )
 
-    @property
-    def num_feature_types(self) -> int:
-        """Number of feature types for embedding table."""
-        try:
-            import ciffy
-            return ciffy.NUM_RESIDUES if self.level == "residue" else ciffy.NUM_ATOMS
-        except ImportError:
-            return 32 if self.level == "residue" else 128
+        if self._device is not None:
+            structure = structure.to(self._device)
 
-    def __len__(self) -> int:
-        return len(self.structures)
-
-    def __getitem__(self, idx: int) -> Structure:
-        return self.structures[idx]
+        return structure
 
     def __iter__(self) -> Iterator[Structure]:
-        return iter(self.structures)
+        for i in range(len(self)):
+            yield self[i]
 
     def to(self, device: torch.device) -> StructureDataset:
-        """Move all structures to device."""
-        new_dataset = StructureDataset(
-            [s.to(device) for s in self.structures],
-            level=self.level,
-        )
-        new_dataset._device = device
-        return new_dataset
+        """Set device for loaded structures."""
+        return StructureDataset(self._dataset, self.level, device)
 
     def split(
         self,
@@ -172,10 +178,11 @@ class StructureDataset(Dataset):
         val: float = 0.1,
         seed: int = 42,
     ) -> tuple[StructureDataset, StructureDataset, StructureDataset]:
-        """Split into train/val/test sets."""
-        import random
+        """Split into train/val/test sets.
 
-        n = len(self.structures)
+        Note: This creates subset views that share the underlying ciffy dataset.
+        """
+        n = len(self._dataset)
         indices = list(range(n))
         random.Random(seed).shuffle(indices)
 
@@ -187,7 +194,35 @@ class StructureDataset(Dataset):
         test_idx = indices[n_train + n_val:]
 
         return (
-            StructureDataset([self.structures[i] for i in train_idx], self.level),
-            StructureDataset([self.structures[i] for i in val_idx], self.level),
-            StructureDataset([self.structures[i] for i in test_idx], self.level),
+            _SubsetDataset(self, train_idx),
+            _SubsetDataset(self, val_idx),
+            _SubsetDataset(self, test_idx),
         )
+
+
+class _SubsetDataset(Dataset):
+    """Subset view of a StructureDataset."""
+
+    def __init__(self, parent: StructureDataset, indices: list[int]):
+        self._parent = parent
+        self._indices = indices
+        self.level = parent.level
+        self._device = parent._device
+
+    @property
+    def num_feature_types(self) -> int:
+        return self._parent.num_feature_types
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    def __getitem__(self, idx: int) -> Structure:
+        return self._parent[self._indices[idx]]
+
+    def __iter__(self) -> Iterator[Structure]:
+        for i in range(len(self)):
+            yield self[i]
+
+    def to(self, device: torch.device) -> _SubsetDataset:
+        subset = _SubsetDataset(self._parent.to(device), self._indices)
+        return subset

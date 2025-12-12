@@ -213,10 +213,11 @@ def run_experiment(config: ExperimentConfig) -> dict:
     level = "residue" if config.data.residue_level else "atom"
     dataset = StructureDataset.from_directory(
         config.data.data_dir,
+        scale="chain",  # iterate over chains
         level=level,
-        max_structures=config.data.num_structures,
+        max_atoms=config.data.max_atoms,
     )
-    print(f"Data loaded in {time.time() - t0:.1f}s")
+    print(f"Data scanned in {time.time() - t0:.1f}s")
 
     if len(dataset) == 0:
         print("ERROR: No structures loaded!")
