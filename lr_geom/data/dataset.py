@@ -145,9 +145,12 @@ class StructureDataset(Dataset):
 
         # Normalize coordinates
         coords = polymer.coordinates.float()
-        coord_scale = coords.std()
-        if coord_scale > 0:
-            coords = coords / coord_scale
+        if coords.shape[0] >= 2:
+            coord_scale = coords.std()
+            if coord_scale > 0:
+                coords = coords / coord_scale
+            else:
+                coord_scale = torch.tensor(1.0)
         else:
             coord_scale = torch.tensor(1.0)
 
