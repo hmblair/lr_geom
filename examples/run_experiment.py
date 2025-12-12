@@ -511,12 +511,16 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
     Returns:
         Dictionary of results.
     """
+    import time
+    t0 = time.time()
+
     # Setup
     set_seed(config.seed)
     device = get_device(config.device)
 
     print(f"Device: {device}")
     print(f"Experiment: {config.name}")
+    print(f"torch.compile: {'enabled' if config.model.use_compile else 'disabled'}")
     print()
 
     # Create output directory
@@ -538,6 +542,8 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
         max_structures=config.data.num_structures,
     )
 
+    print(f"  Data loaded in {time.time() - t0:.1f}s")
+
     if len(dataset) == 0:
         print("No structures loaded! Check data directory.")
         return {"error": "No data"}
@@ -556,7 +562,9 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
     print()
 
     # Build model
+    t_model = time.time()
     embedding, vae = build_model_from_config(config.model, dataset.num_feature_types, device)
+    print(f"  Model built in {time.time() - t_model:.1f}s")
 
     num_params = sum(p.numel() for p in embedding.parameters()) + sum(p.numel() for p in vae.parameters())
     print(f"Model parameters: {num_params:,}")
@@ -658,6 +666,8 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
     best_val_rmsd = float("inf")
     patience_counter = 0
 
+    print(f"Total setup time: {time.time() - t0:.1f}s")
+    print()
     print("Training...")
     epoch_pbar = tqdm(range(1, config.training.epochs + 1), desc="Epochs", ncols=100)
     for epoch in epoch_pbar:
