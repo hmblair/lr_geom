@@ -50,12 +50,12 @@ class ModelConfig:
 
     # Architecture dimensions
     embed_dim: int = 16
-    latent_mult: int = 8
-    hidden_mult: int = 32
-    encoder_layers: int = 4
-    decoder_layers: int = 4
+    latent_mult: int = 4
+    hidden_mult: int = 16
+    encoder_layers: int = 2
+    decoder_layers: int = 2
     k_neighbors: int = 16
-    nheads: int = 8
+    nheads: int = 4
 
     # Regularization
     dropout: float = 0.1
