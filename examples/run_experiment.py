@@ -523,6 +523,14 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
     print(f"torch.compile: {'enabled' if config.model.use_compile else 'disabled'}")
     print()
 
+    # Write initial progress
+    write_progress(progress_file, {
+        "epoch": 0,
+        "total_epochs": config.training.epochs,
+        "status": "initializing",
+        "phase": "setup",
+    })
+
     # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(config.output_dir) / f"{config.name}_{timestamp}"
@@ -533,6 +541,12 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
     print(f"Config saved to: {output_dir / 'config.yaml'}")
 
     # Load data
+    write_progress(progress_file, {
+        "epoch": 0,
+        "total_epochs": config.training.epochs,
+        "status": "loading data",
+        "phase": "data",
+    })
     level = "residue" if config.data.residue_level else "atom"
     dataset = StructureDataset.from_directory(
         config.data.data_dir,
@@ -562,6 +576,12 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
     print()
 
     # Build model
+    write_progress(progress_file, {
+        "epoch": 0,
+        "total_epochs": config.training.epochs,
+        "status": "building model",
+        "phase": "model",
+    })
     t_model = time.time()
     embedding, vae = build_model_from_config(config.model, dataset.num_feature_types, device)
     print(f"  Model built in {time.time() - t_model:.1f}s")

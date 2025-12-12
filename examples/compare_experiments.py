@@ -268,8 +268,9 @@ def run_all_experiments(
                         if pbar.total != actual_total:
                             pbar.total = actual_total
 
-                        # Build postfix string
+                        # Build postfix string based on status
                         status = progress.get("status", "")
+                        phase = progress.get("phase", "")
                         if status == "completed":
                             test_rmsd = progress.get("test_rmsd")
                             if test_rmsd:
@@ -277,6 +278,9 @@ def run_all_experiments(
                             else:
                                 postfix = f"done, val={progress.get('best_val_rmsd', 0):.2f}Å"
                             completed_experiments.add(name)
+                        elif phase in ("setup", "data", "model"):
+                            # Still in setup phase
+                            postfix = status
                         else:
                             val_rmsd = progress.get("val_rmsd", 0)
                             best_rmsd = progress.get("best_val_rmsd", 0)
