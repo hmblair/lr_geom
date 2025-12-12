@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from tqdm import tqdm
 
 # Experiment configurations to compare
 # Fixed k=64, sweep rank=4,8,16, compare node-wise vs edge-wise attention
@@ -101,7 +102,7 @@ def run_single_experiment(
     # Add extra arguments
     cmd.extend(extra_args)
 
-    print(f"[GPU {gpu_id}] Starting {exp_config['name']}...")
+    # Output is captured and saved to log files by run_all_experiments
 
     try:
         result = subprocess.run(
@@ -160,21 +161,30 @@ def run_all_experiments(
         List of result dictionaries.
     """
     results = []
+    output_path = Path(output_dir)
 
     if not gpus:
-        # CPU mode - run sequentially
+        # CPU mode - run sequentially with progress bar
         print("No GPUs available, running experiments sequentially on CPU...")
-        for exp in experiments:
+        for exp in tqdm(experiments, desc="Experiments", ncols=80):
             result = run_single_experiment(
                 exp, -1, base_config, output_dir, extra_args + ["--device", "cpu"]
             )
-            status = "completed" if result["returncode"] == 0 else "FAILED"
-            print(f"[CPU] {exp['name']} {status}")
+            # Save log
+            log_file = output_path / f"{exp['name']}_log.txt"
+            with open(log_file, "w") as f:
+                f.write(f"=== {exp['name']} ===\n")
+                f.write(f"Return code: {result['returncode']}\n\n")
+                f.write("=== STDOUT ===\n")
+                f.write(result.get("stdout", ""))
+                f.write("\n=== STDERR ===\n")
+                f.write(result.get("stderr", ""))
             results.append(result)
         return results
 
-    # GPU mode - run in parallel
+    # GPU mode - run in parallel with progress bar
     print(f"Running {len(experiments)} experiments across {len(gpus)} GPUs...")
+    print(f"Logs will be saved to: {output_path}")
     print()
 
     # Assign experiments to GPUs round-robin
@@ -182,6 +192,10 @@ def run_all_experiments(
         (exp, gpus[i % len(gpus)])
         for i, exp in enumerate(experiments)
     ]
+
+    completed = 0
+    failed = 0
+    pbar = tqdm(total=len(experiments), desc="Experiments", ncols=80)
 
     with ProcessPoolExecutor(max_workers=len(gpus)) as executor:
         futures = {
@@ -192,25 +206,48 @@ def run_all_experiments(
                 base_config,
                 output_dir,
                 extra_args,
-            ): exp["name"]
+            ): exp
             for exp, gpu in assignments
         }
 
         for future in as_completed(futures):
-            name = futures[future]
+            exp = futures[future]
+            name = exp["name"]
             try:
                 result = future.result()
-                status = "completed" if result["returncode"] == 0 else "FAILED"
-                print(f"[GPU {result['gpu_id']}] {name} {status}")
+                success = result["returncode"] == 0
+
+                # Save log file
+                log_file = output_path / f"{name}_log.txt"
+                with open(log_file, "w") as f:
+                    f.write(f"=== {name} ===\n")
+                    f.write(f"GPU: {result.get('gpu_id', 'N/A')}\n")
+                    f.write(f"Return code: {result['returncode']}\n\n")
+                    f.write("=== STDOUT ===\n")
+                    f.write(result.get("stdout", ""))
+                    f.write("\n=== STDERR ===\n")
+                    f.write(result.get("stderr", ""))
+
+                if success:
+                    completed += 1
+                else:
+                    failed += 1
+
                 results.append(result)
+
             except Exception as e:
-                print(f"[ERROR] {name} failed with exception: {e}")
+                failed += 1
                 results.append({
                     "name": name,
                     "returncode": -1,
                     "error": str(e),
                 })
 
+            pbar.update(1)
+            pbar.set_postfix({"done": completed, "failed": failed})
+
+    pbar.close()
+    print()
     return results
 
 
