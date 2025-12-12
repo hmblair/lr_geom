@@ -5,6 +5,7 @@ and feature indices for geometric deep learning.
 """
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Literal, Any
@@ -108,25 +109,38 @@ class StructureDataset(Dataset):
         from ciffy.nn import PolymerDataset
 
         scale_enum = ciffy.CHAIN if scale == "chain" else ciffy.MOLECULE
+        path = Path(path)
 
-        print(f"Scanning {path} (scale={scale}, level={level}, max_atoms={max_atoms})")
+        # If num_structures is set, create temp dir with symlinks to limit scan time
+        scan_path = path
+        temp_dir = None
+        if num_structures is not None:
+            cif_files = sorted(path.glob("*.cif"))[:num_structures]
+            if cif_files:
+                temp_dir = tempfile.mkdtemp(prefix="lr_geom_")
+                scan_path = Path(temp_dir)
+                for f in cif_files:
+                    (scan_path / f.name).symlink_to(f)
+                print(f"Scanning {len(cif_files)} files (limited from {path})")
+            else:
+                print(f"No .cif files found in {path}")
+        else:
+            print(f"Scanning {path} (scale={scale}, level={level}, max_atoms={max_atoms})")
+
         ciffy_dataset = PolymerDataset(
-            directory=path,
+            directory=scan_path,
             scale=scale_enum,
             max_atoms=max_atoms,
             backend="torch",
         )
         print(f"Found {len(ciffy_dataset)} items")
 
-        dataset = cls(ciffy_dataset, level=level, device=device)
+        # Clean up temp dir (symlinks only, originals safe)
+        if temp_dir is not None:
+            import shutil
+            shutil.rmtree(temp_dir)
 
-        # Limit number of structures if requested
-        if num_structures is not None and num_structures < len(dataset):
-            print(f"Limiting to {num_structures} structures")
-            indices = list(range(num_structures))
-            return _SubsetDataset(dataset, indices)
-
-        return dataset
+        return cls(ciffy_dataset, level=level, device=device)
 
     @property
     def num_feature_types(self) -> int:
