@@ -74,7 +74,7 @@ class ProfilerConfig:
     attention_type: str = "node_wise"
     radial_weight_rank: int | None = None
     use_compile: bool = False
-    compile_mode: str = "reduce-overhead"
+    compile_mode: str = "default"
 
 
 class LayerProfiler:

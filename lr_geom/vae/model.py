@@ -353,7 +353,7 @@ class EquivariantVAE(nn.Module):
 
     def compile(
         self,
-        mode: str = "reduce-overhead",
+        mode: str = "default",
         fullgraph: bool = False,
     ) -> "EquivariantVAE":
         """Compile the model using torch.compile for faster execution.
@@ -364,9 +364,9 @@ class EquivariantVAE(nn.Module):
 
         Args:
             mode: Compilation mode. Options:
-                - "reduce-overhead": Reduces Python overhead (default, best for inference)
+                - "default": Balanced compilation (default, good memory usage)
+                - "reduce-overhead": Uses CUDA graphs (faster but high memory usage)
                 - "max-autotune": Maximum optimization (slower compile, faster runtime)
-                - "default": Balanced compilation
             fullgraph: If True, requires the entire forward to compile as one graph.
                 Set to False (default) to allow graph breaks for compatibility.
 
