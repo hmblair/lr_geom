@@ -421,6 +421,11 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Number of test samples to save reconstructions for (default: 3)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate setup without training (load data, build model, run one forward pass)",
+    )
 
     return parser.parse_args()
 
@@ -455,6 +460,8 @@ def main():
     if args.num_structures:
         extra_args.extend(["--num_structures", str(args.num_structures)])
     extra_args.extend(["--num_recon_samples", str(args.num_recon_samples)])
+    if getattr(args, 'dry_run', False):
+        extra_args.append("--dry-run")
 
     # Verify base config exists
     if not Path(args.config).exists():
@@ -493,10 +500,17 @@ def main():
                     print(f"      {line}")
         print("=" * 78)
 
-    # Compare results (small delay to ensure files are flushed)
-    import time
-    time.sleep(2)
-    compare_results(str(output_dir), EXPERIMENT_GRID)
+    # Compare results (skip for dry run)
+    if getattr(args, 'dry_run', False):
+        print()
+        print("=" * 78)
+        print("DRY RUN COMPLETE")
+        print("=" * 78)
+    else:
+        # Small delay to ensure files are flushed
+        import time
+        time.sleep(2)
+        compare_results(str(output_dir), EXPERIMENT_GRID)
 
 
 if __name__ == "__main__":

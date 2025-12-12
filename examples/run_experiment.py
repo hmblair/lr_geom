@@ -391,12 +391,13 @@ def save_reconstructions(
     return saved_ids
 
 
-def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3) -> dict:
+def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run: bool = False) -> dict:
     """Run a single experiment.
 
     Args:
         config: Experiment configuration.
         num_recon_samples: Number of test samples to save reconstructions for.
+        dry_run: If True, validate setup without training (load data, build model, run one forward pass).
 
     Returns:
         Dictionary of results.
@@ -461,6 +462,33 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3) -> dict
     print(f"Skip type: {config.model.skip_type}")
     print(f"RBF type: {config.model.rbf_type}")
     print()
+
+    # Dry run: validate setup without training
+    if dry_run:
+        print("DRY RUN: Validating setup...")
+        embedding.eval()
+        vae.eval()
+        with torch.no_grad():
+            # Run one forward pass with first training structure
+            s = train_structures[0]
+            coords = s["coords"].to(device)
+            atoms = s["atoms"].to(device)
+            features = embedding(atoms).unsqueeze(-1)
+            recon, mu, logvar = vae(coords, features)
+
+            # Also test sampling
+            sampled = vae.sample(coords, features)
+
+            print(f"  Forward pass: OK")
+            print(f"    Input coords: {coords.shape}")
+            print(f"    Features: {features.shape}")
+            print(f"    Reconstruction: {recon.shape}")
+            print(f"    Latent mu: {mu.shape}")
+            print(f"    Sample: {sampled.shape}")
+            print()
+            print("DRY RUN: Setup validated successfully!")
+
+        return {"dry_run": True, "status": "success"}
 
     # Setup optimizer
     params = list(embedding.parameters()) + list(vae.parameters())
@@ -643,6 +671,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, help="Device (cuda, cpu, auto)")
     parser.add_argument("--seed", type=int, help="Random seed")
     parser.add_argument("--num_recon_samples", type=int, default=3, help="Number of test samples to save reconstructions for")
+    parser.add_argument("--dry-run", action="store_true", help="Validate setup without training (load data, build model, run one forward pass)")
 
     return parser.parse_args()
 
@@ -659,7 +688,8 @@ def main():
     config = merge_config_with_args(config, args)
 
     # Run experiment
-    run_experiment(config, num_recon_samples=args.num_recon_samples)
+    dry_run = getattr(args, 'dry_run', False)
+    run_experiment(config, num_recon_samples=args.num_recon_samples, dry_run=dry_run)
 
 
 if __name__ == "__main__":
