@@ -273,10 +273,14 @@ def compare_results(
 
     for exp in experiments:
         # Find the experiment output directory (most recent)
-        exp_dirs = sorted(output_path.glob(f"{exp['name']}_*"))
+        # Filter to only directories (not log files like node_rank2_log.txt)
+        exp_dirs = sorted([
+            d for d in output_path.glob(f"{exp['name']}_*")
+            if d.is_dir()
+        ])
 
         if not exp_dirs:
-            print(f"Warning: No output found for {exp['name']}")
+            print(f"Warning: No output directory found for {exp['name']}")
             continue
 
         exp_dir = exp_dirs[-1]  # Most recent

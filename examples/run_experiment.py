@@ -561,8 +561,20 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3) -> dict
     epoch_times = [m["time"] for m in history["train"]]
     avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
 
-    # Load best model
-    checkpoint = torch.load(output_dir / "best_model.pt")
+    # Load best model (with error handling)
+    best_model_path = output_dir / "best_model.pt"
+    if not best_model_path.exists():
+        print(f"Warning: No best model saved (training may have failed early)")
+        # Save current model as fallback
+        torch.save({
+            "embedding": embedding.state_dict(),
+            "vae": vae.state_dict(),
+            "epoch": epoch if 'epoch' in dir() else 0,
+            "val_loss": best_val_loss,
+            "val_rmsd": best_val_rmsd,
+        }, best_model_path)
+
+    checkpoint = torch.load(best_model_path)
     embedding.load_state_dict(checkpoint["embedding"])
     vae.load_state_dict(checkpoint["vae"])
 
