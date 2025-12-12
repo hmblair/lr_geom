@@ -136,6 +136,10 @@ class TrainingConfig:
         grad_clip: Maximum gradient norm (0 to disable).
         scheduler: Learning rate scheduler ("cosine", "plateau", "none").
         min_lr: Minimum learning rate for schedulers.
+        kl_annealing: KL annealing strategy ("linear", "cyclical", "none").
+        kl_warmup_epochs: Epochs to anneal KL weight from 0 to kl_weight.
+        kl_cycle_epochs: Epochs per cycle for cyclical annealing.
+        free_bits: Minimum KL per latent dimension (0 to disable).
     """
 
     epochs: int = 100
@@ -148,6 +152,12 @@ class TrainingConfig:
     grad_clip: float = 1.0
     scheduler: str = "cosine"
     min_lr: float = 1e-6
+    # KL annealing settings
+    kl_annealing: str = "linear"
+    kl_warmup_epochs: int = 10
+    kl_cycle_epochs: int = 20
+    # Free bits to prevent posterior collapse
+    free_bits: float = 0.0
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
@@ -164,6 +174,16 @@ class TrainingConfig:
                 f"scheduler must be one of {valid_scheduler}, "
                 f"got '{self.scheduler}'"
             )
+
+        valid_kl_annealing = {"linear", "cyclical", "none"}
+        if self.kl_annealing not in valid_kl_annealing:
+            raise ValueError(
+                f"kl_annealing must be one of {valid_kl_annealing}, "
+                f"got '{self.kl_annealing}'"
+            )
+
+        if self.free_bits < 0:
+            raise ValueError(f"free_bits must be non-negative, got {self.free_bits}")
 
 
 @dataclass

@@ -39,6 +39,117 @@ from lr_geom.vae import EquivariantVAE, kl_divergence
 from lr_geom.training import set_seed, get_device
 
 
+def get_kl_weight(
+    epoch: int,
+    config: TrainingConfig,
+) -> float:
+    """Get KL weight for current epoch based on annealing strategy.
+
+    Args:
+        epoch: Current epoch (1-indexed).
+        config: Training configuration.
+
+    Returns:
+        KL weight for this epoch.
+    """
+    if config.kl_annealing == "none":
+        return config.kl_weight
+
+    elif config.kl_annealing == "linear":
+        # Linear warmup from 0 to kl_weight over kl_warmup_epochs
+        if epoch >= config.kl_warmup_epochs:
+            return config.kl_weight
+        return config.kl_weight * (epoch / config.kl_warmup_epochs)
+
+    elif config.kl_annealing == "cyclical":
+        # Cyclical annealing: repeat linear warmup every kl_cycle_epochs
+        # This helps the model repeatedly "re-learn" to use the latent space
+        cycle_position = epoch % config.kl_cycle_epochs
+        if cycle_position == 0:
+            cycle_position = config.kl_cycle_epochs
+        # Linear ramp within each cycle
+        ramp_epochs = config.kl_cycle_epochs // 2  # First half is ramp
+        if cycle_position <= ramp_epochs:
+            return config.kl_weight * (cycle_position / ramp_epochs)
+        return config.kl_weight
+
+    return config.kl_weight
+
+
+def compute_kl_with_free_bits(
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    free_bits: float = 0.0,
+) -> torch.Tensor:
+    """Compute KL divergence with free bits to prevent posterior collapse.
+
+    Free bits ensures a minimum KL per latent dimension, which encourages
+    the model to use the latent space rather than ignoring it.
+
+    Args:
+        mu: Latent mean, shape (N, latent_dim) or (N, mult, repr_dim).
+        logvar: Latent log-variance, shape matching mu or (N, mult).
+        free_bits: Minimum KL per dimension (lambda in the paper).
+
+    Returns:
+        Scalar KL divergence loss.
+    """
+    # Standard KL: -0.5 * (1 + logvar - mu^2 - exp(logvar))
+    # Computed per element then summed
+    kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+
+    if free_bits > 0:
+        # Apply free bits: max(kl, free_bits) per dimension
+        # This ensures each dimension contributes at least free_bits to loss
+        kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
+
+    # Sum over latent dimensions, mean over batch
+    return kl_per_dim.sum(dim=-1).mean()
+
+
+class WarmupScheduler:
+    """Learning rate scheduler with linear warmup.
+
+    Wraps another scheduler and applies linear warmup for the first N epochs.
+    """
+
+    def __init__(
+        self,
+        optimizer: optim.Optimizer,
+        warmup_epochs: int,
+        base_scheduler: optim.lr_scheduler.LRScheduler | None = None,
+    ):
+        """Initialize warmup scheduler.
+
+        Args:
+            optimizer: The optimizer.
+            warmup_epochs: Number of warmup epochs.
+            base_scheduler: Scheduler to use after warmup (optional).
+        """
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.base_scheduler = base_scheduler
+        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+        self.current_epoch = 0
+
+    def step(self) -> None:
+        """Update learning rate."""
+        self.current_epoch += 1
+
+        if self.current_epoch <= self.warmup_epochs:
+            # Linear warmup
+            warmup_factor = self.current_epoch / self.warmup_epochs
+            for param_group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+                param_group['lr'] = base_lr * warmup_factor
+        elif self.base_scheduler is not None:
+            # After warmup, use base scheduler
+            self.base_scheduler.step()
+
+    def get_last_lr(self) -> list[float]:
+        """Get current learning rates."""
+        return [group['lr'] for group in self.optimizer.param_groups]
+
+
 def build_model_from_config(
     config: ModelConfig,
     num_atom_types: int,
@@ -167,6 +278,7 @@ def train_epoch(
     optimizer: optim.Optimizer,
     config: TrainingConfig,
     device: torch.device,
+    kl_weight: float | None = None,
 ) -> dict:
     """Train for one epoch.
 
@@ -177,6 +289,7 @@ def train_epoch(
         optimizer: Optimizer.
         config: Training configuration.
         device: Device.
+        kl_weight: Override KL weight for this epoch (for annealing).
 
     Returns:
         Dictionary of training metrics.
@@ -186,6 +299,9 @@ def train_epoch(
 
     embedding.train()
     vae.train()
+
+    # Use provided kl_weight or fall back to config
+    current_kl_weight = kl_weight if kl_weight is not None else config.kl_weight
 
     total_loss = 0.0
     total_rmsd = 0.0
@@ -216,8 +332,9 @@ def train_epoch(
         pred_polymer = polymer.with_coordinates(coords_pred_unnorm)
         rmsd_loss = ciffy.rmsd(polymer, pred_polymer)
 
-        kl_loss = kl_divergence(mu, logvar).mean()
-        loss = rmsd_loss + config.kl_weight * kl_loss
+        # KL loss with optional free bits
+        kl_loss = compute_kl_with_free_bits(mu, logvar, config.free_bits)
+        loss = rmsd_loss + current_kl_weight * kl_loss
 
         # Backward pass
         optimizer.zero_grad()
@@ -254,6 +371,7 @@ def evaluate(
     vae: EquivariantVAE,
     structures: list[dict],
     config: TrainingConfig,
+    kl_weight: float | None = None,
 ) -> dict:
     """Evaluate model on structures.
 
@@ -262,6 +380,7 @@ def evaluate(
         vae: VAE model.
         structures: List of structure data.
         config: Training configuration.
+        kl_weight: Override KL weight (for consistency with training).
 
     Returns:
         Dictionary of evaluation metrics.
@@ -270,6 +389,9 @@ def evaluate(
 
     embedding.eval()
     vae.eval()
+
+    # Use provided kl_weight or fall back to config
+    current_kl_weight = kl_weight if kl_weight is not None else config.kl_weight
 
     total_loss = 0.0
     total_rmsd = 0.0
@@ -291,8 +413,9 @@ def evaluate(
             pred_polymer = polymer.with_coordinates(coords_pred_unnorm)
             rmsd = ciffy.rmsd(polymer, pred_polymer)
 
-            kl_loss = kl_divergence(mu, logvar).mean()
-            loss = rmsd + config.kl_weight * kl_loss
+            # KL loss with optional free bits
+            kl_loss = compute_kl_with_free_bits(mu, logvar, config.free_bits)
+            loss = rmsd + current_kl_weight * kl_loss
 
             total_loss += loss.item()
             total_rmsd += rmsd.item()
@@ -508,26 +631,39 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
         weight_decay=config.training.weight_decay,
     )
 
-    # Learning rate scheduler
+    # Learning rate scheduler with warmup
+    base_scheduler = None
     if config.training.scheduler == "cosine":
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        base_scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=config.training.epochs,
+            T_max=config.training.epochs - config.training.warmup_epochs,
             eta_min=config.training.min_lr,
         )
     elif config.training.scheduler == "plateau":
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        base_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
             factor=0.5,
             patience=10,
             min_lr=config.training.min_lr,
         )
-    else:
-        scheduler = None
+
+    # Wrap with warmup scheduler
+    scheduler = WarmupScheduler(
+        optimizer,
+        warmup_epochs=config.training.warmup_epochs,
+        base_scheduler=base_scheduler if config.training.scheduler != "plateau" else None,
+    )
+
+    # Print training settings
+    print(f"LR warmup: {config.training.warmup_epochs} epochs")
+    print(f"KL annealing: {config.training.kl_annealing} (warmup: {config.training.kl_warmup_epochs} epochs)")
+    if config.training.free_bits > 0:
+        print(f"Free bits: {config.training.free_bits}")
+    print()
 
     # Training loop
-    history = {"train": [], "val": []}
+    history = {"train": [], "val": [], "kl_weight": [], "lr": []}
     best_val_loss = float("inf")
     best_val_rmsd = float("inf")
     patience_counter = 0
@@ -535,15 +671,20 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
     print("Training...")
     epoch_pbar = tqdm(range(1, config.training.epochs + 1), desc="Epochs", ncols=100)
     for epoch in epoch_pbar:
+        # Get current KL weight based on annealing strategy
+        current_kl_weight = get_kl_weight(epoch, config.training)
+
         # Train
         train_metrics = train_epoch(
-            embedding, vae, train_structures, optimizer, config.training, device
+            embedding, vae, train_structures, optimizer, config.training, device,
+            kl_weight=current_kl_weight,
         )
         history["train"].append(train_metrics)
 
         # Validate
         if val_structures:
-            val_metrics = evaluate(embedding, vae, val_structures, config.training)
+            val_metrics = evaluate(embedding, vae, val_structures, config.training,
+                                   kl_weight=current_kl_weight)
             history["val"].append(val_metrics)
             val_loss = val_metrics["loss"]
             val_rmsd = val_metrics["rmsd"]
@@ -551,12 +692,16 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
             val_loss = train_metrics["loss"]
             val_rmsd = train_metrics["rmsd"]
 
+        # Track KL weight and LR
+        history["kl_weight"].append(current_kl_weight)
+        history["lr"].append(scheduler.get_last_lr()[0])
+
         # Learning rate scheduling
-        if scheduler is not None:
-            if config.training.scheduler == "plateau":
-                scheduler.step(val_loss)
-            else:
-                scheduler.step()
+        if config.training.scheduler == "plateau" and base_scheduler is not None:
+            # Plateau scheduler needs val_loss
+            if epoch > config.training.warmup_epochs:
+                base_scheduler.step(val_loss)
+        scheduler.step()
 
         # Early stopping
         is_best = False
@@ -668,6 +813,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, help="Learning rate")
     parser.add_argument("--batch_size", type=int, help="Batch size")
     parser.add_argument("--kl_weight", type=float, help="KL weight")
+    parser.add_argument("--kl_annealing", type=str, choices=["linear", "cyclical", "none"], help="KL annealing strategy")
+    parser.add_argument("--kl_warmup_epochs", type=int, help="Epochs to anneal KL weight")
+    parser.add_argument("--kl_cycle_epochs", type=int, help="Epochs per cycle for cyclical annealing")
+    parser.add_argument("--free_bits", type=float, help="Minimum KL per dimension to prevent collapse")
+    parser.add_argument("--warmup_epochs", type=int, help="LR warmup epochs")
     parser.add_argument("--k_neighbors", type=int, help="Number of neighbors for k-NN graph")
     parser.add_argument("--attention_type", type=str, choices=["node_wise", "edge_wise"])
     parser.add_argument("--scale_type", type=str, choices=["sqrt_head_dim", "sqrt_dim", "learned", "none"])
