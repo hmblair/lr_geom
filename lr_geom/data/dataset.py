@@ -114,12 +114,19 @@ class StructureDataset(Dataset):
             directory=path,
             scale=scale_enum,
             max_atoms=max_atoms,
-            num_structures=num_structures,
             backend="torch",
         )
         print(f"Found {len(ciffy_dataset)} items")
 
-        return cls(ciffy_dataset, level=level, device=device)
+        dataset = cls(ciffy_dataset, level=level, device=device)
+
+        # Limit number of structures if requested
+        if num_structures is not None and num_structures < len(dataset):
+            print(f"Limiting to {num_structures} structures")
+            indices = list(range(num_structures))
+            return _SubsetDataset(dataset, indices)
+
+        return dataset
 
     @property
     def num_feature_types(self) -> int:
@@ -232,3 +239,32 @@ class _SubsetDataset(Dataset):
     def to(self, device: torch.device) -> _SubsetDataset:
         subset = _SubsetDataset(self._parent.to(device), self._indices)
         return subset
+
+    def split(
+        self,
+        train: float = 0.8,
+        val: float = 0.1,
+        seed: int = 42,
+    ) -> tuple[_SubsetDataset, _SubsetDataset, _SubsetDataset]:
+        """Split into train/val/test sets."""
+        n = len(self._indices)
+        local_indices = list(range(n))
+        random.Random(seed).shuffle(local_indices)
+
+        n_train = int(n * train)
+        n_val = int(n * val)
+
+        train_local = local_indices[:n_train]
+        val_local = local_indices[n_train:n_train + n_val]
+        test_local = local_indices[n_train + n_val:]
+
+        # Map back to parent indices
+        train_idx = [self._indices[i] for i in train_local]
+        val_idx = [self._indices[i] for i in val_local]
+        test_idx = [self._indices[i] for i in test_local]
+
+        return (
+            _SubsetDataset(self._parent, train_idx),
+            _SubsetDataset(self._parent, val_idx),
+            _SubsetDataset(self._parent, test_idx),
+        )
