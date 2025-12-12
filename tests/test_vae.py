@@ -227,14 +227,15 @@ class TestEquivariantVAE:
         # Sample
         z = reparameterize(mu, logvar)
 
-        # Decode
-        recon = vae_small.decode(coords, z)
+        # Decode (requires conditioning - use input features)
+        recon = vae_small.decode(coords, z, cond=features)
         assert recon.shape == (coords.size(0), out_repr.mult, out_repr.dim())
 
     def test_sample_from_prior(self, vae_small, vae_input, out_repr):
         """Test sampling from prior."""
-        coords, _ = vae_input
-        sample = vae_small.sample(coords)
+        coords, features = vae_input
+        # sample() requires conditioning features (decoder needs atom types)
+        sample = vae_small.sample(coords, cond=features)
         assert sample.shape == (coords.size(0), out_repr.mult, out_repr.dim())
         assert not torch.isnan(sample).any()
 
@@ -277,27 +278,30 @@ class TestEquivariantVAE:
         """Test that the decoder is equivariant.
 
         For rotation R:
-        - decode(R*coords, R*z) = R*decode(coords, z)
+        - decode(R*coords, R*z, R*cond) = R*decode(coords, z, cond)
         """
         axis, angle = rotation_params
-        coords, _ = vae_input
+        coords, features = vae_input
         vae_small.eval()
 
-        # Create latent sample
+        # Create latent sample and use features as conditioning
         N = coords.size(0)
         z = torch.randn(N, vae_small.latent_repr.mult, vae_small.latent_repr.dim())
+        cond = features  # Use input features as conditioning
 
         # Decode original
-        output1 = vae_small.decode(coords, z)
+        output1 = vae_small.decode(coords, z, cond)
 
-        # Rotate inputs
+        # Rotate inputs (coords, z, and conditioning)
         R = get_3d_rotation_matrix(axis, angle)
         D_latent = get_wigner_d_matrix(vae_small.latent_repr, axis, angle)
+        D_cond = get_wigner_d_matrix(vae_small.cond_repr, axis, angle)
         coords_rotated = coords @ R.T
         z_rotated = z @ D_latent.T
+        cond_rotated = cond @ D_cond.T
 
         # Decode rotated
-        output2 = vae_small.decode(coords_rotated, z_rotated)
+        output2 = vae_small.decode(coords_rotated, z_rotated, cond_rotated)
 
         # Check equivariance (use relaxed tolerance for deep decoder network)
         D_out = get_wigner_d_matrix(vae_small.out_repr, axis, angle)
@@ -403,23 +407,36 @@ class TestVAEIntegration:
         Note: All configs use out_repr with same lvals as hidden_repr to
         ensure equivariance. There's a known issue with EquivariantTransformer
         equivariance when output lvals differ from hidden lvals.
+
+        Also: latent_repr and cond_repr must have same lvals since they're
+        concatenated for decoder input. When cond_repr=None (default), it uses
+        in_repr, so in_repr.lvals must match latent_repr.lvals.
         """
         configs = [
-            # Scalars only latent (out has [0,1] to match hidden)
-            (lg.Repr([0, 1], mult=4), lg.Repr([0], mult=8), lg.Repr([0, 1], mult=1)),
-            # Higher order latent
-            (lg.Repr([0, 1], mult=4), lg.Repr([0, 1, 2], mult=2), lg.Repr([0, 1], mult=2)),
-            # Different multiplicities (out has [0,1] to match hidden)
-            (lg.Repr([0, 1, 2], mult=2), lg.Repr([0, 1], mult=4), lg.Repr([0, 1], mult=3)),
+            # in_repr, latent_repr, out_repr, cond_repr (optional)
+            # Standard config - all [0,1]
+            (lg.Repr([0, 1], mult=4), lg.Repr([0, 1], mult=2), lg.Repr([0, 1], mult=1), None),
+            # Higher order latent - need explicit cond_repr to match
+            (lg.Repr([0, 1], mult=4), lg.Repr([0, 1, 2], mult=2), lg.Repr([0, 1], mult=2),
+             lg.Repr([0, 1, 2], mult=4)),  # cond matches latent lvals
+            # Different multiplicities
+            (lg.Repr([0, 1], mult=2), lg.Repr([0, 1], mult=4), lg.Repr([0, 1], mult=3), None),
+            # Scalars only latent with matching conditioning
+            (lg.Repr([0, 1], mult=4), lg.Repr([0], mult=8), lg.Repr([0, 1], mult=1),
+             lg.Repr([0], mult=4)),  # cond matches latent lvals (scalars)
         ]
 
-        for in_repr, latent_repr, out_repr in configs:
+        for config in configs:
+            in_repr, latent_repr, out_repr = config[:3]
+            cond_repr = config[3] if len(config) > 3 else None
+
             hidden_repr = lg.Repr([0, 1], mult=8)
             vae = EquivariantVAE(
                 in_repr=in_repr,
                 latent_repr=latent_repr,
                 out_repr=out_repr,
                 hidden_repr=hidden_repr,
+                cond_repr=cond_repr,
                 encoder_layers=1,
                 decoder_layers=1,
                 k_neighbors=8,
@@ -429,8 +446,13 @@ class TestVAEIntegration:
             coords = torch.randn(20, 3)
             features = torch.randn(20, in_repr.mult, in_repr.dim())
 
-            # Forward should work
-            recon, mu, logvar = vae(coords, features)
+            # If cond_repr differs from in_repr, need separate conditioning tensor
+            if cond_repr is not None and cond_repr.lvals != in_repr.lvals:
+                cond = torch.randn(20, cond_repr.mult, cond_repr.dim())
+                recon, mu, logvar = vae(coords, features, cond=cond)
+            else:
+                # Use features as conditioning (default)
+                recon, mu, logvar = vae(coords, features)
 
             # Check shapes
             assert recon.shape == (20, out_repr.mult, out_repr.dim())

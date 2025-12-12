@@ -1595,8 +1595,9 @@ class TestArchitectureDiagnostics:
 
         The standard attention pattern uses:
         - Q: EquivariantLinear (node-level, keeps input lvals)
-        - K: EquivariantConvolution (edge-level, keeps input lvals for Q·K)
-        - V: EquivariantConvolution (edge-level, can change to output lvals)
+        - K/V: EquivariantConvolution (edge-level)
+          - When K and V have same lvals: fused into single conv_kv
+          - When different lvals: separate conv_k and conv_v
         """
         repr = lg.Repr(lvals=[0, 1], mult=8)
         product_repr = lg.ProductRepr(repr, repr)
@@ -1609,16 +1610,22 @@ class TestArchitectureDiagnostics:
         assert hasattr(attn, 'proj_q'), "Attention should have proj_q for queries"
         assert isinstance(attn.proj_q, lg.EquivariantLinear), "Q should use EquivariantLinear"
 
-        # Verify K has its own convolution
-        assert hasattr(attn, 'conv_k'), "Attention should have conv_k for keys"
-        assert isinstance(attn.conv_k, lg.EquivariantConvolution), "K should use EquivariantConvolution"
+        # When rep1.lvals == rep2.lvals, K and V are fused into conv_kv
+        # When they differ, we get separate conv_k and conv_v
+        if attn.can_fuse_kv:
+            # Fused K/V convolution
+            assert hasattr(attn, 'conv_kv'), "Attention should have conv_kv when lvals match"
+            assert isinstance(attn.conv_kv, lg.EquivariantConvolution), "K/V should use EquivariantConvolution"
+        else:
+            # Separate K and V convolutions
+            assert hasattr(attn, 'conv_k'), "Attention should have conv_k for keys"
+            assert isinstance(attn.conv_k, lg.EquivariantConvolution), "K should use EquivariantConvolution"
 
-        # Verify V has its own convolution
-        assert hasattr(attn, 'conv_v'), "Attention should have conv_v for values"
-        assert isinstance(attn.conv_v, lg.EquivariantConvolution), "V should use EquivariantConvolution"
+            assert hasattr(attn, 'conv_v'), "Attention should have conv_v for values"
+            assert isinstance(attn.conv_v, lg.EquivariantConvolution), "V should use EquivariantConvolution"
 
-        # Verify K and V are separate modules (not sharing weights)
-        assert attn.conv_k is not attn.conv_v, "K and V should have separate convolutions"
+            # Verify K and V are separate modules (not sharing weights)
+            assert attn.conv_k is not attn.conv_v, "K and V should have separate convolutions"
 
     def test_first_layer_gradient_magnitude(self, diagnostic_setup):
         """Test gradient magnitude at first layer (no skip connection case)."""

@@ -38,12 +38,21 @@ def _init_weights(module: nn.Module) -> None:
             nn.init.zeros_(module.bias)
 
 
-def build_knn_graph(coordinates: torch.Tensor, k: int) -> torch.Tensor:
+def build_knn_graph(
+    coordinates: torch.Tensor,
+    k: int,
+    chunk_size: int = 2048,
+) -> torch.Tensor:
     """Build k-nearest neighbor graph from 3D coordinates.
+
+    Uses chunked computation for large N to reduce peak memory from O(N²) to
+    O(chunk_size * N). For small N, uses direct computation.
 
     Args:
         coordinates: Node coordinates of shape (N, 3).
         k: Number of nearest neighbors per node.
+        chunk_size: Maximum chunk size for distance computation. Larger values
+            are faster but use more memory. Default 2048 uses ~32MB per chunk.
 
     Returns:
         Neighbor indices of shape (N, k), where neighbor_idx[i] contains
@@ -74,14 +83,26 @@ def build_knn_graph(coordinates: torch.Tensor, k: int) -> torch.Tensor:
                 result[i, len(others):] = others[-1] if len(others) > 0 else 0
         return result
 
-    # Compute pairwise squared distances
-    dists = torch.cdist(coordinates, coordinates)  # (N, N)
+    # For small N, use direct computation (faster, memory is acceptable)
+    if N <= chunk_size:
+        dists = torch.cdist(coordinates, coordinates)  # (N, N)
+        _, indices = dists.topk(k + 1, largest=False, dim=-1)  # (N, k+1)
+        return indices[:, 1:]  # Exclude self
 
-    # Get k+1 nearest neighbors (including self at index 0)
-    _, indices = dists.topk(k + 1, largest=False, dim=-1)  # (N, k+1)
+    # For large N, use chunked computation to reduce peak memory
+    # Peak memory: O(chunk_size * N) instead of O(N²)
+    neighbor_idx = torch.empty(N, k, dtype=torch.long, device=coordinates.device)
 
-    # Exclude self (first column after sorting by distance)
-    return indices[:, 1:]  # (N, k)
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        # Compute distances from this chunk to all nodes
+        chunk_dists = torch.cdist(coordinates[start:end], coordinates)  # (chunk, N)
+        # Get k+1 nearest neighbors for this chunk
+        _, chunk_indices = chunk_dists.topk(k + 1, largest=False, dim=-1)
+        # Exclude self (distance 0 is always to self at same index)
+        neighbor_idx[start:end] = chunk_indices[:, 1:]
+
+    return neighbor_idx
 
 
 class RadialWeight(nn.Module):
@@ -754,17 +775,32 @@ class EquivariantAttention(nn.Module):
         # Q: Node-level projection (EquivariantLinear, keeps rep1 lvals)
         self.proj_q = EquivariantLinear(repr.rep1, repr.rep1, dropout=dropout, activation=None)
 
-        # K: Edge-level convolution (keeps rep1 lvals for Q·K compatibility)
-        repr_k = ProductRepr(deepcopy(repr.rep1), deepcopy(repr.rep1))
-        self.conv_k = EquivariantConvolution(
-            repr_k, edge_dim, edge_hidden_dim, dropout, radial_weight_rank=radial_weight_rank
-        )
+        # Check if K and V can be fused (same lvals)
+        self.can_fuse_kv = repr.rep1.lvals == repr.rep2.lvals
 
-        # V: Edge-level convolution (can change to rep2 lvals)
-        repr_v = ProductRepr(deepcopy(repr.rep1), deepcopy(repr.rep2))
-        self.conv_v = EquivariantConvolution(
-            repr_v, edge_dim, edge_hidden_dim, dropout, radial_weight_rank=radial_weight_rank
-        )
+        if self.can_fuse_kv:
+            # Fused K+V: Single convolution with 2x output multiplicity
+            rep1_copy = deepcopy(repr.rep1)
+            rep2_fused = deepcopy(repr.rep2)
+            rep2_fused.mult = repr.rep1.mult + repr.rep2.mult  # K mult + V mult
+            repr_kv = ProductRepr(rep1_copy, rep2_fused)
+            self.conv_kv = EquivariantConvolution(
+                repr_kv, edge_dim, edge_hidden_dim, dropout, radial_weight_rank=radial_weight_rank
+            )
+            self.k_mult = repr.rep1.mult  # Where to split K from V
+        else:
+            # Separate K and V convolutions (different lvals)
+            # K: Edge-level convolution (keeps rep1 lvals for Q·K compatibility)
+            repr_k = ProductRepr(deepcopy(repr.rep1), deepcopy(repr.rep1))
+            self.conv_k = EquivariantConvolution(
+                repr_k, edge_dim, edge_hidden_dim, dropout, radial_weight_rank=radial_weight_rank
+            )
+
+            # V: Edge-level convolution (can change to rep2 lvals)
+            repr_v = ProductRepr(deepcopy(repr.rep1), deepcopy(repr.rep2))
+            self.conv_v = EquivariantConvolution(
+                repr_v, edge_dim, edge_hidden_dim, dropout, radial_weight_rank=radial_weight_rank
+            )
 
     def _init_edge_wise(
         self, repr: ProductRepr, edge_dim: int, edge_hidden_dim: int, dropout: float,
@@ -827,46 +863,73 @@ class EquivariantAttention(nn.Module):
         src_idx = neighbor_idx.flatten()  # (N*k,)
         edge_feats_flat = edge_feats.view(N * k, -1)
 
-        # Flatten basis for keys (rep1->rep1)
-        b1_k, b2_k = basis_k
-        b1_k_flat = b1_k.view(N * k, *b1_k.shape[2:])
-        b2_k_flat = b2_k.view(N * k, *b2_k.shape[2:])
+        if self.can_fuse_kv:
+            # Fused K+V computation (same lvals, use basis_v for both)
+            b1_v, b2_v = basis_v
+            b1_v_flat = b1_v.view(N * k, *b1_v.shape[2:])
+            b2_v_flat = b2_v.view(N * k, *b2_v.shape[2:])
 
-        # Flatten basis for values (rep1->rep2)
-        b1_v, b2_v = basis_v
-        b1_v_flat = b1_v.view(N * k, *b1_v.shape[2:])
-        b2_v_flat = b2_v.view(N * k, *b2_v.shape[2:])
+            # Single convolution for K and V
+            kv = self.conv_kv((b1_v_flat, b2_v_flat), edge_feats_flat, f, src_idx)
+            kv = kv.view(N, k, self.k_mult + self.out_mult, self.in_dim)
 
-        # === Compute Keys (edge-level, same lvals as Q) ===
-        keys = self.conv_k((b1_k_flat, b2_k_flat), edge_feats_flat, f, src_idx)
-        keys = keys.view(N, k, self.in_mult, self.in_dim)
+            # Split into K and V
+            keys = kv[:, :, :self.k_mult, :]  # (N, k, in_mult, in_dim)
+            values = kv[:, :, self.k_mult:, :]  # (N, k, out_mult, out_dim)
+        else:
+            # Separate K and V convolutions (different lvals)
+            # Flatten basis for keys (rep1->rep1)
+            b1_k, b2_k = basis_k
+            b1_k_flat = b1_k.view(N * k, *b1_k.shape[2:])
+            b2_k_flat = b2_k.view(N * k, *b2_k.shape[2:])
 
-        # === Compute Values (edge-level, can change lvals) ===
-        values = self.conv_v((b1_v_flat, b2_v_flat), edge_feats_flat, f, src_idx)
-        values = values.view(N, k, self.out_mult, self.out_dim)
+            # Flatten basis for values (rep1->rep2)
+            b1_v, b2_v = basis_v
+            b1_v_flat = b1_v.view(N * k, *b1_v.shape[2:])
+            b2_v_flat = b2_v.view(N * k, *b2_v.shape[2:])
+
+            # === Compute Keys (edge-level, same lvals as Q) ===
+            keys = self.conv_k((b1_k_flat, b2_k_flat), edge_feats_flat, f, src_idx)
+            keys = keys.view(N, k, self.in_mult, self.in_dim)
+
+            # === Compute Values (edge-level, can change lvals) ===
+            values = self.conv_v((b1_v_flat, b2_v_flat), edge_feats_flat, f, src_idx)
+            values = values.view(N, k, self.out_mult, self.out_dim)
 
         # === Multi-head attention ===
-        q_heads = queries.flatten(-2, -1).view(N, self.nheads, self.head_dim)
+        # Reshape for attention: (N, nheads, seq_len, head_dim)
+        q_heads = queries.flatten(-2, -1).view(N, self.nheads, 1, self.head_dim)
         k_heads = keys.flatten(-2, -1).view(N, k, self.nheads, self.head_dim)
-        k_heads = k_heads.transpose(1, 2)
+        k_heads = k_heads.transpose(1, 2)  # (N, nheads, k, head_dim)
 
         v_hidden_size = self.out_mult * self.out_dim
         v_head_dim = v_hidden_size // self.nheads
         v_heads = values.flatten(-2, -1).view(N, k, self.nheads, v_head_dim)
-        v_heads = v_heads.transpose(1, 2)
+        v_heads = v_heads.transpose(1, 2)  # (N, nheads, k, v_head_dim)
 
-        # === Attention scores: Q_i · K_ij ===
-        scores = (q_heads.unsqueeze(2) @ k_heads.transpose(-2, -1)).squeeze(2) * self.scale
+        # Use SDPA for non-learned scaling (fused CUDA kernels)
+        # Fall back to manual for learned scaling (Parameter requires grad)
+        if isinstance(self.scale, nn.Parameter):
+            # Manual attention for learned scale
+            attn = torch.matmul(q_heads, k_heads.transpose(-2, -1)) * self.scale
+            if mask is not None:
+                attn = attn.masked_fill(mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+            attn = F.softmax(attn, dim=-1)
+            attn = self.attn_dropout(attn)
+            output = torch.matmul(attn, v_heads)  # (N, nheads, 1, v_head_dim)
+        else:
+            # Use PyTorch's optimized scaled dot-product attention
+            attn_mask = None
+            if mask is not None:
+                attn_mask = mask.unsqueeze(1).unsqueeze(2)  # (N, 1, 1, k)
+            output = F.scaled_dot_product_attention(
+                q_heads, k_heads, v_heads,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                scale=self.scale,
+            )  # (N, nheads, 1, v_head_dim)
 
-        if mask is not None:
-            scores = scores.masked_fill(mask.unsqueeze(1), float('-inf'))
-
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
-
-        # === Weighted sum of values ===
-        output = (attn_weights.unsqueeze(2) @ v_heads).squeeze(2)
-        output = output.view(N, self.out_mult, self.out_dim)
+        output = output.squeeze(2).view(N, self.out_mult, self.out_dim)
 
         return self.out_proj(output)
 

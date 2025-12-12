@@ -264,6 +264,13 @@ def compare_results(
     output_path = Path(output_dir)
     results = []
 
+    # Debug: show what directories exist
+    all_dirs = list(output_path.glob("*_*"))
+    if not all_dirs:
+        print(f"Warning: No experiment directories found in {output_path}")
+        print(f"  Path exists: {output_path.exists()}")
+        print(f"  Contents: {list(output_path.iterdir()) if output_path.exists() else 'N/A'}")
+
     for exp in experiments:
         # Find the experiment output directory (most recent)
         exp_dirs = sorted(output_path.glob(f"{exp['name']}_*"))
@@ -277,6 +284,8 @@ def compare_results(
 
         if not results_file.exists():
             print(f"Warning: No results.pt found for {exp['name']}")
+            print(f"  Checked: {results_file}")
+            print(f"  Dir contents: {list(exp_dir.iterdir()) if exp_dir.exists() else 'N/A'}")
             continue
 
         try:
@@ -480,7 +489,9 @@ def main():
                     print(f"      {line}")
         print("=" * 78)
 
-    # Compare results
+    # Compare results (small delay to ensure files are flushed)
+    import time
+    time.sleep(2)
     compare_results(str(output_dir), EXPERIMENT_GRID)
 
 

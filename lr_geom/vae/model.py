@@ -4,37 +4,44 @@ This module implements an SO(3)-equivariant VAE for point clouds where:
 - Each point gets its own latent vector z_i
 - Latent space uses configurable representations (any combination of l=0, l=1, l=2, ...)
 - Equivariance is maintained through equivariant encoder/decoder
+- Decoder receives conditioning features (e.g., atom types) to inform reconstruction
 
 Key insight: The Gaussian sampling doesn't need to be isotropic. Equivariance is ensured by:
 1. Equivariant encoder: encode(R*x) = (R*mu, sigma)
-2. Equivariant decoder: decode(R*z, R*coords) = R*decode(z, coords)
+2. Equivariant decoder: decode(R*z, R*cond, R*coords) = R*decode(z, cond, coords)
+
+The conditioning mechanism allows the decoder to know what type of atom/residue is at
+each position, which is essential for learning chemically meaningful reconstructions.
 
 Example:
     >>> import lr_geom as lg
     >>> from lr_geom.vae import EquivariantVAE
     >>>
     >>> # Define representations
-    >>> in_repr = lg.Repr([0, 1], mult=8)
+    >>> in_repr = lg.Repr([0, 1], mult=8)   # Atom type embeddings
     >>> latent_repr = lg.Repr([0, 1], mult=4)
-    >>> out_repr = lg.Repr([1], mult=1)  # For coordinate reconstruction
+    >>> out_repr = lg.Repr([1], mult=1)     # For coordinate reconstruction
     >>> hidden_repr = lg.Repr([0, 1], mult=16)
     >>>
-    >>> # Create VAE
+    >>> # Create VAE - decoder will receive latent + atom embeddings
     >>> vae = EquivariantVAE(
     ...     in_repr=in_repr,
     ...     latent_repr=latent_repr,
     ...     out_repr=out_repr,
     ...     hidden_repr=hidden_repr,
     ...     k_neighbors=16,
+    ...     cond_repr=in_repr,  # Use atom embeddings as conditioning
     ... )
     >>>
     >>> # Forward pass
     >>> coords = torch.randn(50, 3)
     >>> features = torch.randn(50, in_repr.mult, in_repr.dim())
-    >>> recon, mu, logvar = vae(coords, features)
+    >>> recon, mu, logvar = vae(coords, features)  # features used as conditioning
 """
 
 from __future__ import annotations
+
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -42,6 +49,32 @@ import torch.nn as nn
 from ..representations import Repr
 from ..equivariant import RepNorm
 from ..layers import EquivariantLinear, EquivariantTransformer
+
+
+def _combine_reprs(repr1: Repr, repr2: Repr) -> Repr:
+    """Combine two representations by concatenating multiplicities.
+
+    Both representations must have the same lvals. The result has
+    mult = repr1.mult + repr2.mult.
+
+    Args:
+        repr1: First representation.
+        repr2: Second representation.
+
+    Returns:
+        Combined representation.
+
+    Raises:
+        ValueError: If lvals don't match.
+    """
+    if repr1.lvals != repr2.lvals:
+        raise ValueError(
+            f"Cannot combine representations with different lvals: "
+            f"{repr1.lvals} vs {repr2.lvals}"
+        )
+    combined = deepcopy(repr1)
+    combined.mult = repr1.mult + repr2.mult
+    return combined
 
 
 class VariationalHead(nn.Module):
@@ -151,15 +184,24 @@ class EquivariantVAE(nn.Module):
     latent vector, and all representations (input, latent, output) are
     fully configurable.
 
+    The decoder receives conditioning features (e.g., atom type embeddings)
+    concatenated with the latent samples. This allows the decoder to know
+    what type of atom/residue is at each position, which is essential for
+    learning chemically meaningful reconstructions.
+
     The equivariance property ensures:
     - encode(R*x) = (R*mu, sigma) - mu rotates, sigma invariant
-    - decode(R*z, R*coords) = R*decode(z, coords)
+    - decode(R*z, R*cond, R*coords) = R*decode(z, cond, coords)
 
     Args:
-        in_repr: Input feature representation.
+        in_repr: Input feature representation (encoder input).
         latent_repr: Latent space representation.
         out_repr: Output representation (decoder output).
         hidden_repr: Hidden layer representation for both encoder and decoder.
+        cond_repr: Conditioning representation for decoder. If None, defaults to
+            in_repr. The decoder receives latent_repr + cond_repr as input.
+            This allows flexible conditioning on atom types, residue types,
+            element embeddings, or any combination thereof.
         encoder_layers: Number of transformer blocks in encoder. Defaults to 4.
         decoder_layers: Number of transformer blocks in decoder. Defaults to 4.
         k_neighbors: Number of neighbors for k-NN graph construction.
@@ -180,9 +222,10 @@ class EquivariantVAE(nn.Module):
         radial_weight_rank: Rank for low-rank RadialWeight decomposition. None for full rank.
 
     Example:
-        >>> in_repr = Repr([0, 1], mult=8)
+        >>> # Basic usage - conditioning on input features (atom embeddings)
+        >>> in_repr = Repr([0, 1], mult=8)   # Atom type embeddings
         >>> latent_repr = Repr([0, 1], mult=4)
-        >>> out_repr = Repr([1], mult=1)  # Coordinates
+        >>> out_repr = Repr([1], mult=1)     # Coordinates
         >>> hidden_repr = Repr([0, 1], mult=16)
         >>>
         >>> vae = EquivariantVAE(
@@ -196,6 +239,12 @@ class EquivariantVAE(nn.Module):
         >>> coords = torch.randn(50, 3)
         >>> features = torch.randn(50, in_repr.mult, in_repr.dim())
         >>> recon, mu, logvar = vae(coords, features)
+        >>>
+        >>> # Advanced: separate conditioning (e.g., residue + element embeddings)
+        >>> cond_repr = Repr([0, 1], mult=12)  # Larger conditioning
+        >>> vae = EquivariantVAE(..., cond_repr=cond_repr)
+        >>> cond_features = torch.randn(50, cond_repr.mult, cond_repr.dim())
+        >>> recon, mu, logvar = vae(coords, features, cond_features)
     """
 
     def __init__(
@@ -204,6 +253,7 @@ class EquivariantVAE(nn.Module):
         latent_repr: Repr,
         out_repr: Repr,
         hidden_repr: Repr,
+        cond_repr: Repr | None = None,
         encoder_layers: int = 4,
         decoder_layers: int = 4,
         k_neighbors: int = 16,
@@ -227,6 +277,10 @@ class EquivariantVAE(nn.Module):
         self.latent_repr = latent_repr
         self.out_repr = out_repr
         self.hidden_repr = hidden_repr
+
+        # Conditioning representation defaults to input representation
+        # This allows decoder to know atom types, residue types, etc.
+        self.cond_repr = cond_repr if cond_repr is not None else in_repr
 
         # Encoder: in_repr -> latent_repr
         self.encoder = EquivariantTransformer(
@@ -255,9 +309,11 @@ class EquivariantVAE(nn.Module):
             latent_repr, latent_repr, hidden_dim=var_hidden_dim
         )
 
-        # Decoder: latent_repr -> out_repr
+        # Decoder: (latent_repr + cond_repr) -> out_repr
+        # The decoder receives concatenated [z, conditioning] as input
+        decoder_in_repr = _combine_reprs(latent_repr, self.cond_repr)
         self.decoder = EquivariantTransformer(
-            in_repr=latent_repr,
+            in_repr=decoder_in_repr,
             out_repr=out_repr,
             hidden_repr=hidden_repr,
             hidden_layers=decoder_layers,
@@ -293,46 +349,74 @@ class EquivariantVAE(nn.Module):
         x = self.encoder(coords, features)
         return self.var_head(x)
 
-    def decode(self, coords: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self,
+        coords: torch.Tensor,
+        z: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> torch.Tensor:
         """Decode latent samples to output representation.
+
+        The decoder receives both the latent samples and conditioning features
+        (e.g., atom type embeddings) to inform the reconstruction.
 
         Args:
             coords: Point coordinates of shape (N, 3).
             z: Latent samples of shape (N, latent_mult, latent_dim).
+            cond: Conditioning features of shape (N, cond_mult, cond_dim).
+                Must match cond_repr specification.
 
         Returns:
             Decoded output of shape (N, out_mult, out_dim).
         """
-        return self.decoder(coords, z)
+        # Concatenate latent samples with conditioning along multiplicity dim
+        decoder_input = torch.cat([z, cond], dim=1)  # (N, latent_mult + cond_mult, dim)
+        return self.decoder(coords, decoder_input)
 
     def forward(
-        self, coords: torch.Tensor, features: torch.Tensor
+        self,
+        coords: torch.Tensor,
+        features: torch.Tensor,
+        cond: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Full forward pass: encode, sample, decode.
 
         Args:
             coords: Point coordinates of shape (N, 3).
             features: Input features of shape (N, in_mult, in_dim).
+            cond: Optional conditioning features of shape (N, cond_mult, cond_dim).
+                If None, uses `features` as conditioning (default behavior).
+                This allows separate encoder input and decoder conditioning.
 
         Returns:
             recon: Reconstructed output of shape (N, out_mult, out_dim).
             mu: Latent mean of shape (N, latent_mult, latent_dim).
             logvar: Latent log-variance of shape (N, latent_mult).
         """
+        # Default: use input features as conditioning
+        if cond is None:
+            cond = features
+
         mu, logvar = self.encode(coords, features)
         z = reparameterize(mu, logvar)
-        recon = self.decode(coords, z)
+        recon = self.decode(coords, z, cond)
         return recon, mu, logvar
 
     def sample(
         self,
         coords: torch.Tensor,
+        cond: torch.Tensor,
         num_samples: int = 1,
     ) -> torch.Tensor:
         """Sample from prior and decode.
 
+        Requires conditioning features since the decoder needs to know
+        atom types to generate meaningful structures.
+
         Args:
             coords: Point coordinates of shape (N, 3).
+            cond: Conditioning features of shape (N, cond_mult, cond_dim).
+                Required - decoder needs atom type information.
             num_samples: Number of samples to generate. Currently only 1 supported.
 
         Returns:
@@ -349,7 +433,7 @@ class EquivariantVAE(nn.Module):
             device=device,
             dtype=dtype,
         )
-        return self.decode(coords, z)
+        return self.decode(coords, z, cond)
 
     def compile(
         self,
