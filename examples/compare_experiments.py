@@ -216,20 +216,26 @@ def run_all_experiments(
     print(f"Logs will be saved to: {output_path}")
     print()
 
+    # Reserve space for progress bars (one line per experiment)
+    for _ in experiments:
+        print()
+
     # Create temp directory for progress files
     progress_dir = tempfile.mkdtemp(prefix="lr_geom_progress_")
 
     # Create progress file paths and progress bars
     progress_files = {}
     progress_bars = {}
-    for exp in experiments:
+    pbar_lock = threading.Lock()
+
+    for i, exp in enumerate(experiments):
         name = exp["name"]
         progress_files[name] = str(Path(progress_dir) / f"{name}.json")
         progress_bars[name] = tqdm(
             total=total_epochs,
             desc=f"{name:<16}",
             ncols=100,
-            position=len(progress_bars),
+            position=i,
             leave=True,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{postfix}]",
         )
@@ -247,38 +253,39 @@ def run_all_experiments(
     def monitor_progress():
         """Background thread to update progress bars."""
         while not stop_monitoring.is_set():
-            for exp in experiments:
-                name = exp["name"]
-                if name in completed_experiments:
-                    continue
-                progress = read_progress(progress_files[name])
-                if progress:
-                    pbar = progress_bars[name]
-                    epoch = progress.get("epoch", 0)
-                    actual_total = progress.get("total_epochs", total_epochs)
+            with pbar_lock:
+                for exp in experiments:
+                    name = exp["name"]
+                    if name in completed_experiments:
+                        continue
+                    progress = read_progress(progress_files[name])
+                    if progress:
+                        pbar = progress_bars[name]
+                        epoch = progress.get("epoch", 0)
+                        actual_total = progress.get("total_epochs", total_epochs)
 
-                    # Update total if different
-                    if pbar.total != actual_total:
-                        pbar.total = actual_total
-                        pbar.refresh()
+                        # Update total if different
+                        if pbar.total != actual_total:
+                            pbar.total = actual_total
 
-                    # Update progress
-                    pbar.n = epoch
-                    pbar.refresh()
-
-                    # Update postfix
-                    status = progress.get("status", "")
-                    if status == "completed":
-                        test_rmsd = progress.get("test_rmsd")
-                        if test_rmsd:
-                            pbar.set_postfix_str(f"done, test={test_rmsd:.2f}Å")
+                        # Build postfix string
+                        status = progress.get("status", "")
+                        if status == "completed":
+                            test_rmsd = progress.get("test_rmsd")
+                            if test_rmsd:
+                                postfix = f"done, test={test_rmsd:.2f}Å"
+                            else:
+                                postfix = f"done, val={progress.get('best_val_rmsd', 0):.2f}Å"
+                            completed_experiments.add(name)
                         else:
-                            pbar.set_postfix_str(f"done, val={progress.get('best_val_rmsd', 0):.2f}Å")
-                        completed_experiments.add(name)
-                    else:
-                        val_rmsd = progress.get("val_rmsd", 0)
-                        best_rmsd = progress.get("best_val_rmsd", 0)
-                        pbar.set_postfix_str(f"val={val_rmsd:.2f}Å best={best_rmsd:.2f}Å")
+                            val_rmsd = progress.get("val_rmsd", 0)
+                            best_rmsd = progress.get("best_val_rmsd", 0)
+                            postfix = f"val={val_rmsd:.2f}Å best={best_rmsd:.2f}Å"
+
+                        # Update progress bar (single update call)
+                        pbar.n = epoch
+                        pbar.set_postfix_str(postfix, refresh=False)
+                        pbar.refresh()
 
             time.sleep(1)  # Update every second
 
@@ -323,21 +330,23 @@ def run_all_experiments(
                         f.write("\n=== STDERR ===\n")
                         f.write(result.get("stderr", ""))
 
-                    if success:
-                        completed += 1
-                        # Mark as complete in progress bar
-                        pbar = progress_bars[name]
-                        pbar.n = pbar.total
-                        pbar.refresh()
-                    else:
-                        failed += 1
-                        progress_bars[name].set_postfix_str("FAILED")
+                    with pbar_lock:
+                        if success:
+                            completed += 1
+                            # Mark as complete in progress bar
+                            pbar = progress_bars[name]
+                            pbar.n = pbar.total
+                            pbar.refresh()
+                        else:
+                            failed += 1
+                            progress_bars[name].set_postfix_str("FAILED")
 
                     results.append(result)
 
                 except Exception as e:
                     failed += 1
-                    progress_bars[name].set_postfix_str("ERROR")
+                    with pbar_lock:
+                        progress_bars[name].set_postfix_str("ERROR")
                     results.append({
                         "name": name,
                         "returncode": -1,
