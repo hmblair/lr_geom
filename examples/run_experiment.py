@@ -548,15 +548,17 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
         "phase": "data",
     })
     level = "residue" if config.data.residue_level else "atom"
+    # If --no-filter is set, skip size filtering for instant startup
+    no_filter = getattr(config, '_no_filter', False)
     dataset = StructureDataset.from_directory(
         config.data.data_dir,
         level=level,
-        min_nodes=config.data.min_atoms,
-        max_nodes=config.data.max_atoms,
+        min_nodes=0 if no_filter else config.data.min_atoms,
+        max_nodes=None if no_filter else config.data.max_atoms,
         max_structures=config.data.num_structures,
     )
 
-    print(f"  Data loaded in {time.time() - t0:.1f}s")
+    print(f"  Data scanned in {time.time() - t0:.1f}s (lazy loading enabled)")
 
     if len(dataset) == 0:
         print("No structures loaded! Check data directory.")
@@ -876,6 +878,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_recon_samples", type=int, default=3, help="Number of test samples to save reconstructions for")
     parser.add_argument("--dry-run", action="store_true", help="Validate setup without training (load data, build model, run one forward pass)")
     parser.add_argument("--progress_file", type=str, help="Path to write progress updates (for external monitoring)")
+    parser.add_argument("--no-filter", action="store_true", help="Skip size filtering for instant startup (structures loaded lazily)")
 
     return parser.parse_args()
 
@@ -890,6 +893,10 @@ def main():
 
     # Merge with command line overrides
     config = merge_config_with_args(config, args)
+
+    # Handle --no-filter flag
+    if getattr(args, 'no_filter', False):
+        config._no_filter = True
 
     # Run experiment
     dry_run = getattr(args, 'dry_run', False)

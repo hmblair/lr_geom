@@ -52,17 +52,58 @@ class Structure:
         )
 
 
-class StructureDataset(Dataset):
-    """PyTorch Dataset for molecular structures.
+def _load_structure(
+    path: str | Path,
+    level: Literal["atom", "residue"],
+) -> Structure:
+    """Load a single structure from CIF file.
 
-    Loads structures from CIF files with optional filtering and
-    supports atom-level or residue-level representation.
+    Args:
+        path: Path to .cif file.
+        level: Granularity ("atom" or "residue").
+
+    Returns:
+        Structure instance.
+    """
+    import ciffy
+
+    polymer = ciffy.load(str(path), backend="torch")
+
+    # Center at appropriate level
+    if level == "residue":
+        polymer, _ = polymer.center(ciffy.RESIDUE)
+        features = polymer.sequence
+        max_idx = ciffy.NUM_RESIDUES - 1
+    else:
+        polymer, _ = polymer.center()
+        features = polymer.atoms
+        max_idx = ciffy.NUM_ATOMS - 1
+
+    # Normalize coordinates
+    coords = polymer.coordinates.float()
+    coord_scale = coords.std()
+    coords_normalized = coords / coord_scale
+
+    return Structure(
+        coords=coords_normalized,
+        features=features.long().clamp(min=0, max=max_idx),
+        coord_scale=coord_scale,
+        polymer=polymer,
+        id=polymer.id(),
+    )
+
+
+class StructureDataset(Dataset):
+    """PyTorch Dataset for molecular structures with lazy loading.
+
+    Structures are loaded on-demand from CIF files, not all at once.
+    This provides fast startup and lower memory usage.
 
     This class handles all domain-specific loading logic, so training
     code only needs to work with generic (coords, features) pairs.
 
     Example:
-        # Atom-level dataset
+        # Atom-level dataset (lazy loading)
         dataset = StructureDataset.from_directory(
             "/path/to/cifs",
             level="atom",
@@ -70,19 +111,13 @@ class StructureDataset(Dataset):
             max_nodes=500,
         )
 
-        # Residue-level dataset
-        dataset = StructureDataset.from_directory(
-            "/path/to/cifs",
-            level="residue",
-        )
-
         # Split into train/val/test
         train, val, test = dataset.split(train=0.8, val=0.1)
 
-        # Move to GPU
+        # Move to GPU (structures loaded on access)
         train = train.to(device)
 
-        # Use in training loop
+        # Use in training loop - structures loaded here
         for structure in train:
             features = embedding(structure.features)
             output = model(structure.coords, features)
@@ -90,21 +125,25 @@ class StructureDataset(Dataset):
 
     def __init__(
         self,
-        structures: list[Structure],
+        file_paths: list[Path],
         level: Literal["atom", "residue"] = "atom",
         num_feature_types: int | None = None,
+        device: torch.device | None = None,
     ):
-        """Initialize dataset with pre-loaded structures.
+        """Initialize dataset with file paths for lazy loading.
 
         Args:
-            structures: List of Structure objects.
+            file_paths: List of paths to .cif files.
             level: Granularity level ("atom" or "residue").
             num_feature_types: Number of feature types (for embedding table).
-                If None, will be inferred from ciffy constants.
+            device: Device to move structures to when loaded.
         """
-        self.structures = structures
+        self._file_paths = file_paths
         self.level = level
         self._num_feature_types = num_feature_types
+        self._device = device
+        # Cache for loaded structures
+        self._cache: dict[int, Structure] = {}
 
     @classmethod
     def from_directory(
@@ -116,7 +155,10 @@ class StructureDataset(Dataset):
         max_structures: int | None = None,
         verbose: bool = True,
     ) -> StructureDataset:
-        """Load structures from a directory of CIF files.
+        """Create dataset from a directory of CIF files.
+
+        Performs a quick scan to filter by size, but doesn't keep
+        structures in memory. Actual loading happens on access.
 
         Args:
             path: Directory containing .cif files.
@@ -145,63 +187,71 @@ class StructureDataset(Dataset):
         if not path.exists():
             raise FileNotFoundError(f"Data directory not found: {path}")
 
-        structures = []
         cif_files = sorted(path.glob("*.cif"))
 
         if verbose:
-            print(f"Loading structures from {path} ({level}-level)")
+            print(f"Scanning structures from {path} ({level}-level)")
             print(f"Found {len(cif_files)} CIF files")
 
-        for cif_file in cif_files:
-            try:
-                structure = cls._load_structure(cif_file, level)
+        # Quick scan to filter by size (doesn't keep structures in memory)
+        valid_paths = []
+        needs_filtering = min_nodes > 0 or max_nodes is not None
 
-                # Filter by size
-                n_nodes = structure.coords.shape[0]
-                if n_nodes < min_nodes:
+        if needs_filtering:
+            for cif_file in cif_files:
+                try:
+                    # Quick load just to check size
+                    polymer = ciffy.load(str(cif_file), backend="torch")
+                    if level == "residue":
+                        n_nodes = polymer.num_residues
+                    else:
+                        n_nodes = polymer.num_atoms
+
+                    if n_nodes < min_nodes:
+                        continue
+                    if max_nodes is not None and n_nodes > max_nodes:
+                        continue
+
+                    valid_paths.append(cif_file)
+
+                    if max_structures and len(valid_paths) >= max_structures:
+                        break
+
+                except Exception as e:
+                    if verbose:
+                        print(f"  Warning: Could not scan {cif_file.name}: {e}")
                     continue
-                if max_nodes is not None and n_nodes > max_nodes:
-                    continue
-
-                structures.append(structure)
-
-                if max_structures and len(structures) >= max_structures:
-                    break
-
-            except Exception as e:
-                if verbose:
-                    print(f"  Warning: Could not load {cif_file.name}: {e}")
-                continue
+        else:
+            # No filtering needed, just use all files
+            if max_structures:
+                valid_paths = cif_files[:max_structures]
+            else:
+                valid_paths = cif_files
 
         if verbose:
-            print(f"Loaded {len(structures)} structures")
+            print(f"Found {len(valid_paths)} valid structures")
 
         # Get num_feature_types from ciffy
         num_feature_types = (
             ciffy.NUM_RESIDUES if level == "residue" else ciffy.NUM_ATOMS
         )
 
-        return cls(structures, level=level, num_feature_types=num_feature_types)
+        return cls(valid_paths, level=level, num_feature_types=num_feature_types)
 
     @classmethod
     def from_files(
         cls,
         paths: list[str | Path],
         level: Literal["atom", "residue"] = "atom",
-        verbose: bool = True,
     ) -> StructureDataset:
-        """Load structures from specific CIF files.
+        """Create dataset from specific CIF files.
 
         Args:
             paths: List of paths to .cif files.
             level: Granularity ("atom" or "residue").
-            verbose: Print loading progress.
 
         Returns:
             StructureDataset instance.
-
-        Raises:
-            ImportError: If ciffy is not installed.
         """
         try:
             import ciffy
@@ -211,61 +261,42 @@ class StructureDataset(Dataset):
                 "Install from: https://github.com/hmblair/ciffy"
             )
 
-        structures = []
-        for path in paths:
-            try:
-                structures.append(cls._load_structure(path, level))
-            except Exception as e:
-                if verbose:
-                    print(f"  Warning: Could not load {path}: {e}")
-                continue
-
         num_feature_types = (
             ciffy.NUM_RESIDUES if level == "residue" else ciffy.NUM_ATOMS
         )
 
-        return cls(structures, level=level, num_feature_types=num_feature_types)
+        return cls(
+            [Path(p) for p in paths],
+            level=level,
+            num_feature_types=num_feature_types,
+        )
 
-    @staticmethod
-    def _load_structure(
-        path: str | Path,
-        level: Literal["atom", "residue"],
-    ) -> Structure:
-        """Load a single structure from CIF file.
+    @classmethod
+    def from_structures(
+        cls,
+        structures: list[Structure],
+        level: Literal["atom", "residue"] = "atom",
+        num_feature_types: int | None = None,
+    ) -> StructureDataset:
+        """Create dataset from pre-loaded structures.
 
         Args:
-            path: Path to .cif file.
-            level: Granularity ("atom" or "residue").
+            structures: List of Structure objects.
+            level: Granularity level.
+            num_feature_types: Number of feature types.
 
         Returns:
-            Structure instance.
+            StructureDataset instance with pre-cached structures.
         """
-        import ciffy
-
-        polymer = ciffy.load(str(path), backend="torch")
-
-        # Center at appropriate level
-        if level == "residue":
-            polymer, _ = polymer.center(ciffy.RESIDUE)
-            features = polymer.sequence
-            max_idx = ciffy.NUM_RESIDUES - 1
-        else:
-            polymer, _ = polymer.center()
-            features = polymer.atoms
-            max_idx = ciffy.NUM_ATOMS - 1
-
-        # Normalize coordinates
-        coords = polymer.coordinates.float()
-        coord_scale = coords.std()
-        coords_normalized = coords / coord_scale
-
-        return Structure(
-            coords=coords_normalized,
-            features=features.long().clamp(min=0, max=max_idx),
-            coord_scale=coord_scale,
-            polymer=polymer,
-            id=polymer.id(),
+        dataset = cls(
+            file_paths=[],
+            level=level,
+            num_feature_types=num_feature_types,
         )
+        # Pre-populate cache
+        dataset._cache = {i: s for i, s in enumerate(structures)}
+        dataset._file_paths = [None] * len(structures)  # Placeholder
+        return dataset
 
     @property
     def num_feature_types(self) -> int:
@@ -276,35 +307,77 @@ class StructureDataset(Dataset):
         # Fallback: infer from ciffy if available
         try:
             import ciffy
-
             return ciffy.NUM_RESIDUES if self.level == "residue" else ciffy.NUM_ATOMS
         except ImportError:
-            # Default fallback
             return 128 if self.level == "atom" else 32
 
     def __len__(self) -> int:
-        return len(self.structures)
+        return len(self._file_paths)
 
     def __getitem__(self, idx: int) -> Structure:
-        return self.structures[idx]
+        """Load and return structure at index (with caching)."""
+        if idx in self._cache:
+            return self._cache[idx]
+
+        # Load structure
+        structure = _load_structure(self._file_paths[idx], self.level)
+
+        # Move to device if specified
+        if self._device is not None:
+            structure = structure.to(self._device)
+
+        # Cache for future access
+        self._cache[idx] = structure
+        return structure
 
     def __iter__(self) -> Iterator[Structure]:
-        return iter(self.structures)
+        for i in range(len(self)):
+            yield self[i]
 
     def to(self, device: torch.device) -> StructureDataset:
-        """Move all structures to device.
+        """Set device for loaded structures.
+
+        Structures already in cache are moved immediately.
+        Future loads will be placed on this device.
 
         Args:
             device: Target device.
 
         Returns:
-            New StructureDataset with structures on device.
+            New StructureDataset with device set.
         """
-        return StructureDataset(
-            [s.to(device) for s in self.structures],
+        # Create new dataset with same paths but new device
+        new_dataset = StructureDataset(
+            file_paths=self._file_paths,
             level=self.level,
             num_feature_types=self._num_feature_types,
+            device=device,
         )
+        # Move cached structures to device
+        new_dataset._cache = {
+            i: s.to(device) for i, s in self._cache.items()
+        }
+        return new_dataset
+
+    def preload(self, verbose: bool = True) -> StructureDataset:
+        """Eagerly load all structures into cache.
+
+        Args:
+            verbose: Show progress bar.
+
+        Returns:
+            Self for chaining.
+        """
+        from tqdm import tqdm
+
+        iterator = range(len(self))
+        if verbose:
+            iterator = tqdm(iterator, desc="Preloading", ncols=80)
+
+        for i in iterator:
+            _ = self[i]  # Triggers load and cache
+
+        return self
 
     def split(
         self,
@@ -330,7 +403,7 @@ class StructureDataset(Dataset):
 
         import random
 
-        n = len(self.structures)
+        n = len(self._file_paths)
         indices = list(range(n))
         random.Random(seed).shuffle(indices)
 
@@ -341,20 +414,17 @@ class StructureDataset(Dataset):
         val_idx = indices[n_train : n_train + n_val]
         test_idx = indices[n_train + n_val :]
 
-        return (
-            StructureDataset(
-                [self.structures[i] for i in train_idx],
-                self.level,
-                self._num_feature_types,
-            ),
-            StructureDataset(
-                [self.structures[i] for i in val_idx],
-                self.level,
-                self._num_feature_types,
-            ),
-            StructureDataset(
-                [self.structures[i] for i in test_idx],
-                self.level,
-                self._num_feature_types,
-            ),
-        )
+        def make_subset(idx_list: list[int]) -> StructureDataset:
+            subset = StructureDataset(
+                file_paths=[self._file_paths[i] for i in idx_list],
+                level=self.level,
+                num_feature_types=self._num_feature_types,
+                device=self._device,
+            )
+            # Copy any cached structures
+            for new_idx, old_idx in enumerate(idx_list):
+                if old_idx in self._cache:
+                    subset._cache[new_idx] = self._cache[old_idx]
+            return subset
+
+        return make_subset(train_idx), make_subset(val_idx), make_subset(test_idx)

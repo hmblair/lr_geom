@@ -608,6 +608,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable torch.compile (useful for debugging)",
     )
+    parser.add_argument(
+        "--no-filter",
+        action="store_true",
+        help="Skip size filtering for instant startup (lazy loading)",
+    )
 
     return parser.parse_args()
 
@@ -663,6 +668,8 @@ def main():
         extra_args.append("--residue_level")
     if getattr(args, 'no_compile', False):
         extra_args.append("--no-compile")
+    if getattr(args, 'no_filter', False):
+        extra_args.append("--no-filter")
 
     # Verify base config exists
     if not Path(args.config).exists():
