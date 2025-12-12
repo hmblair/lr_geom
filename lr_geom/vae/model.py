@@ -77,6 +77,128 @@ def _combine_reprs(repr1: Repr, repr2: Repr) -> Repr:
     return combined
 
 
+class ConditioningProjection(nn.Module):
+    """Project conditioning features to match target representation's lvals.
+
+    When conditioning has fewer angular momenta than the target (e.g., scalars
+    only while target has scalars + vectors), this layer:
+    1. Applies an equivariant linear to shared lvals (projecting multiplicity)
+    2. Pads missing lvals with zeros
+
+    This allows flexible conditioning where atom type embeddings (scalars only)
+    can be used with latent spaces that include higher-order components.
+
+    Args:
+        cond_repr: Source conditioning representation.
+        target_repr: Target representation (typically latent_repr).
+            The output will have target_repr's lvals with cond_repr's projected mult.
+    """
+
+    def __init__(self, cond_repr: Repr, target_repr: Repr) -> None:
+        super().__init__()
+        self.cond_repr = cond_repr
+        self.target_repr = target_repr
+
+        # Check which lvals are shared vs need padding
+        self.shared_lvals = [l for l in cond_repr.lvals if l in target_repr.lvals]
+        self.pad_lvals = [l for l in target_repr.lvals if l not in cond_repr.lvals]
+
+        # Create projected representation with shared lvals
+        if self.shared_lvals:
+            self.shared_repr = Repr(self.shared_lvals, mult=cond_repr.mult)
+            self.projected_repr = Repr(self.shared_lvals, mult=target_repr.mult)
+            self.proj = EquivariantLinear(self.shared_repr, self.projected_repr)
+        else:
+            self.proj = None
+
+        # Compute output representation (target's lvals, target's mult)
+        self.out_repr = Repr(target_repr.lvals, mult=target_repr.mult)
+
+        # Precompute indices for assembling output
+        self._compute_indices()
+
+    def _compute_indices(self) -> None:
+        """Precompute source and destination indices for efficient forward."""
+        # Source indices: where to read from projected/cond features
+        # Dest indices: where to write in output
+
+        self.src_indices = []
+        self.dst_indices = []
+
+        # For each l in target, find where it comes from
+        cond_cdims = self.cond_repr.cumdims()
+        target_cdims = self.target_repr.cumdims()
+
+        for i, l in enumerate(self.target_repr.lvals):
+            dst_start = target_cdims[i]
+            dst_end = target_cdims[i + 1]
+
+            if l in self.cond_repr.lvals:
+                # This l exists in conditioning - will come from projection
+                cond_idx = self.cond_repr.lvals.index(l)
+                src_start = cond_cdims[cond_idx]
+                src_end = cond_cdims[cond_idx + 1]
+                self.src_indices.append((src_start, src_end))
+            else:
+                # This l doesn't exist - will be zeros
+                self.src_indices.append(None)
+
+            self.dst_indices.append((dst_start, dst_end))
+
+    def forward(self, cond: torch.Tensor) -> torch.Tensor:
+        """Project conditioning features to target representation.
+
+        Args:
+            cond: Conditioning features of shape (N, cond_mult, cond_dim).
+
+        Returns:
+            Projected features of shape (N, target_mult, target_dim).
+        """
+        N = cond.size(0)
+        device = cond.device
+        dtype = cond.dtype
+
+        # Initialize output with zeros
+        out = torch.zeros(
+            N, self.target_repr.mult, self.target_repr.dim(),
+            device=device, dtype=dtype
+        )
+
+        if self.proj is None:
+            # No shared lvals - return zeros
+            return out
+
+        # Extract shared lvals from conditioning
+        shared_features = []
+        cond_cdims = self.cond_repr.cumdims()
+        for l in self.shared_lvals:
+            idx = self.cond_repr.lvals.index(l)
+            start, end = cond_cdims[idx], cond_cdims[idx + 1]
+            shared_features.append(cond[:, :, start:end])
+
+        # Concatenate shared features
+        shared_cond = torch.cat(shared_features, dim=-1)  # (N, cond_mult, shared_dim)
+
+        # Project to target multiplicity
+        projected = self.proj(shared_cond)  # (N, target_mult, shared_dim)
+
+        # Place projected features in output at correct positions
+        proj_cdims = self.projected_repr.cumdims()
+        target_cdims = self.target_repr.cumdims()
+
+        for i, l in enumerate(self.target_repr.lvals):
+            if l in self.shared_lvals:
+                shared_idx = self.shared_lvals.index(l)
+                proj_start = proj_cdims[shared_idx]
+                proj_end = proj_cdims[shared_idx + 1]
+                tgt_start = target_cdims[i]
+                tgt_end = target_cdims[i + 1]
+                out[:, :, tgt_start:tgt_end] = projected[:, :, proj_start:proj_end]
+            # else: remains zeros (already initialized)
+
+        return out
+
+
 class VariationalHead(nn.Module):
     """Variational head that produces equivariant mu and invariant logvar.
 
@@ -309,9 +431,15 @@ class EquivariantVAE(nn.Module):
             latent_repr, latent_repr, hidden_dim=var_hidden_dim
         )
 
-        # Decoder: (latent_repr + cond_repr) -> out_repr
-        # The decoder receives concatenated [z, conditioning] as input
-        decoder_in_repr = _combine_reprs(latent_repr, self.cond_repr)
+        # Conditioning projection: map cond_repr -> latent_repr's structure
+        # This handles cases where cond_repr has different lvals than latent_repr
+        # (e.g., scalar atom embeddings with vector latent space)
+        self.cond_proj = ConditioningProjection(self.cond_repr, latent_repr)
+
+        # Decoder: (latent_repr + projected_cond_repr) -> out_repr
+        # The decoder receives concatenated [z, projected_conditioning] as input
+        # Both z and projected_cond have latent_repr's lvals
+        decoder_in_repr = _combine_reprs(latent_repr, latent_repr)  # 2x latent mult
         self.decoder = EquivariantTransformer(
             in_repr=decoder_in_repr,
             out_repr=out_repr,
@@ -369,8 +497,11 @@ class EquivariantVAE(nn.Module):
         Returns:
             Decoded output of shape (N, out_mult, out_dim).
         """
-        # Concatenate latent samples with conditioning along multiplicity dim
-        decoder_input = torch.cat([z, cond], dim=1)  # (N, latent_mult + cond_mult, dim)
+        # Project conditioning to match latent representation's lvals
+        cond_projected = self.cond_proj(cond)  # (N, latent_mult, latent_dim)
+
+        # Concatenate latent samples with projected conditioning along multiplicity dim
+        decoder_input = torch.cat([z, cond_projected], dim=1)  # (N, 2*latent_mult, latent_dim)
         return self.decoder(coords, decoder_input)
 
     def forward(

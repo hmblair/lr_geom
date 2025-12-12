@@ -404,26 +404,27 @@ class TestVAEIntegration:
     def test_different_repr_configurations(self):
         """Test VAE with various representation configurations.
 
-        Note: All configs use out_repr with same lvals as hidden_repr to
-        ensure equivariance. There's a known issue with EquivariantTransformer
-        equivariance when output lvals differ from hidden lvals.
-
-        Also: latent_repr and cond_repr must have same lvals since they're
-        concatenated for decoder input. When cond_repr=None (default), it uses
-        in_repr, so in_repr.lvals must match latent_repr.lvals.
+        The ConditioningProjection layer allows cond_repr to have different
+        lvals than latent_repr - it will project/pad as needed. This enables:
+        - Scalar-only atom embeddings with vector latent space
+        - Different multiplicities between conditioning and latent
         """
         configs = [
             # in_repr, latent_repr, out_repr, cond_repr (optional)
             # Standard config - all [0,1]
             (lg.Repr([0, 1], mult=4), lg.Repr([0, 1], mult=2), lg.Repr([0, 1], mult=1), None),
-            # Higher order latent - need explicit cond_repr to match
-            (lg.Repr([0, 1], mult=4), lg.Repr([0, 1, 2], mult=2), lg.Repr([0, 1], mult=2),
-             lg.Repr([0, 1, 2], mult=4)),  # cond matches latent lvals
+            # Higher order latent with lower order conditioning (CRITICAL TEST)
+            # This was previously failing - scalar conditioning with vector latent
+            (lg.Repr([0], mult=8), lg.Repr([0, 1], mult=4), lg.Repr([0, 1], mult=1), None),
+            # Vector conditioning with scalar+vector latent
+            (lg.Repr([0, 1], mult=4), lg.Repr([0, 1, 2], mult=2), lg.Repr([0, 1], mult=2), None),
             # Different multiplicities
             (lg.Repr([0, 1], mult=2), lg.Repr([0, 1], mult=4), lg.Repr([0, 1], mult=3), None),
-            # Scalars only latent with matching conditioning
-            (lg.Repr([0, 1], mult=4), lg.Repr([0], mult=8), lg.Repr([0, 1], mult=1),
-             lg.Repr([0], mult=4)),  # cond matches latent lvals (scalars)
+            # Scalars only everywhere
+            (lg.Repr([0], mult=8), lg.Repr([0], mult=4), lg.Repr([0, 1], mult=1), None),
+            # Explicit cond_repr with different lvals
+            (lg.Repr([0, 1], mult=4), lg.Repr([0, 1, 2], mult=2), lg.Repr([0, 1], mult=2),
+             lg.Repr([0], mult=8)),  # scalar conditioning with higher-order latent
         ]
 
         for config in configs:
@@ -446,8 +447,8 @@ class TestVAEIntegration:
             coords = torch.randn(20, 3)
             features = torch.randn(20, in_repr.mult, in_repr.dim())
 
-            # If cond_repr differs from in_repr, need separate conditioning tensor
-            if cond_repr is not None and cond_repr.lvals != in_repr.lvals:
+            # If cond_repr is explicitly provided, use it
+            if cond_repr is not None:
                 cond = torch.randn(20, cond_repr.mult, cond_repr.dim())
                 recon, mu, logvar = vae(coords, features, cond=cond)
             else:
@@ -458,3 +459,7 @@ class TestVAEIntegration:
             assert recon.shape == (20, out_repr.mult, out_repr.dim())
             assert mu.shape == (20, latent_repr.mult, latent_repr.dim())
             assert logvar.shape == (20, latent_repr.mult)
+            # Check no NaN
+            assert not torch.isnan(recon).any(), f"NaN in recon for config: {config}"
+            assert not torch.isnan(mu).any(), f"NaN in mu for config: {config}"
+            assert not torch.isnan(logvar).any(), f"NaN in logvar for config: {config}"
