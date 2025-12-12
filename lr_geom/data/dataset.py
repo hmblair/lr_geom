@@ -85,6 +85,7 @@ class StructureDataset(Dataset):
         level: Literal["atom", "residue"] = "atom",
         max_atoms: int | None = None,
         num_structures: int | None = None,
+        molecule_type: Literal["rna", "protein", "dna"] | None = "rna",
         device: torch.device | None = None,
     ) -> StructureDataset:
         """Create dataset from directory of CIF files.
@@ -99,6 +100,7 @@ class StructureDataset(Dataset):
                 - "residue": use residue type indices
             max_atoms: Maximum atoms per item (filtered out if exceeded).
             num_structures: Maximum number of structures to load (None for all).
+            molecule_type: Filter by molecule type ("rna", "protein", "dna", or None for all).
             device: Device for tensors.
 
         Returns:
@@ -109,11 +111,18 @@ class StructureDataset(Dataset):
 
         scale_enum = ciffy.CHAIN if scale == "chain" else ciffy.MOLECULE
 
-        print(f"Scanning {path} (scale={scale}, level={level}, max_atoms={max_atoms})")
+        # Map molecule type string to ciffy enum
+        molecule_types = None
+        if molecule_type is not None:
+            type_map = {"rna": ciffy.RNA, "protein": ciffy.PROTEIN, "dna": ciffy.DNA}
+            molecule_types = type_map.get(molecule_type.lower())
+
+        print(f"Scanning {path} (scale={scale}, level={level}, max_atoms={max_atoms}, molecule_type={molecule_type})")
         ciffy_dataset = PolymerDataset(
             directory=path,
             scale=scale_enum,
             max_atoms=max_atoms,
+            molecule_types=molecule_types,
             backend="torch",
         )
         print(f"Found {len(ciffy_dataset)} items")

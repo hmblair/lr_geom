@@ -89,8 +89,6 @@ def train_epoch(
     progress: bool = True,
 ) -> dict:
     """Train for one epoch."""
-    import ciffy
-
     embedding.train()
     vae.train()
 
@@ -104,9 +102,7 @@ def train_epoch(
     for idx in iterator:
         structure = dataset[idx]
 
-        # Skip non-RNA chains and empty structures
-        if not structure.polymer.istype(ciffy.RNA):
-            continue
+        # Skip structures with too few atoms
         if structure.coords.shape[0] < 3:
             continue
 
@@ -143,17 +139,13 @@ def evaluate(
     distance_weight: float,
 ) -> dict:
     """Evaluate on dataset."""
-    import ciffy
-
     embedding.eval()
     vae.eval()
 
     totals = {"loss": 0, "rmsd": 0, "kl": 0, "dist": 0}
     n = 0
     for s in dataset:
-        # Skip non-RNA chains and empty structures
-        if not s.polymer.istype(ciffy.RNA):
-            continue
+        # Skip structures with too few atoms
         if s.coords.shape[0] < 3:
             continue
 
