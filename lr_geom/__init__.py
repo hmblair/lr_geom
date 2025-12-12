@@ -93,6 +93,10 @@ from .config import (
     save_config,
 )
 
+# Training system (imported separately to avoid circular imports)
+# Access via: from lr_geom.training import Trainer, ModelCheckpoint, etc.
+# or: import lr_geom; lg.training.Trainer
+
 __all__ = [
     # Version
     "__version__",

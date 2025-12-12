@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import lr_geom as lg
 from lr_geom.vae import EquivariantVAE, kl_divergence
+from lr_geom.training import set_seed, get_device
 
 # ciffy for loading CIF files
 sys.path.insert(0, str(Path.home() / "academic/software/ciffy"))
@@ -716,7 +717,7 @@ def main():
     print(f"  Num structures: {args.num_structures if args.num_structures else 'all'}")
     print()
 
-    device = torch.device(args.device)
+    device = get_device(args.device)
 
     # Load dataset
     dataset = CIFDataset(args.cif_dir, max_atoms=args.max_atoms, limit=args.num_structures)

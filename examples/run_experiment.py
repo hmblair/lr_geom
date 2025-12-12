@@ -1,7 +1,8 @@
 """Run experiments from YAML configuration files.
 
 This script provides a simple way to run reproducible training experiments
-using configuration files.
+using configuration files. Uses the lr_geom.training module for a clean,
+callback-based training loop.
 
 Usage:
     python examples/run_experiment.py --config configs/baseline.yaml
@@ -35,16 +36,7 @@ from lr_geom.config import (
     merge_config_with_args,
 )
 from lr_geom.vae import EquivariantVAE, kl_divergence
-
-
-def set_seed(seed: int) -> None:
-    """Set random seeds for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+from lr_geom.training import set_seed, get_device
 
 
 def build_model_from_config(
@@ -404,11 +396,7 @@ def run_experiment(config: ExperimentConfig, num_recon_samples: int = 3, dry_run
     """
     # Setup
     set_seed(config.seed)
-
-    if config.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(config.device)
+    device = get_device(config.device)
 
     print(f"Device: {device}")
     print(f"Experiment: {config.name}")
