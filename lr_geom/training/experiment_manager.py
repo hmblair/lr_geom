@@ -1,18 +1,18 @@
 """Experiment management for running multiple experiments.
 
-Provides an ExperimentManager class that runs experiments in a single process
-with support for multi-GPU parallelism via threading.
+Provides an ExperimentManager class that coordinates experiments with
+support for multi-GPU parallelism via multiprocessing (process isolation
+ensures CUDA safety).
 """
 from __future__ import annotations
 
 import copy
-import queue
+import multiprocessing as mp
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
 from typing import Any, Literal
 
 import torch
@@ -53,226 +53,44 @@ class ExperimentResult:
     output_dir: Path | None = None
 
 
-class ExperimentManager:
-    """Manage multiple experiments with real-time progress tracking.
+def _run_experiment_process(
+    name: str,
+    config: ExperimentConfig,
+    exp_dir: Path,
+    gpu: int,
+    progress_queue: mp.Queue,
+) -> ExperimentResult:
+    """Run a single experiment in a separate process.
 
-    Runs experiments in a single process using threading for multi-GPU
-    parallelism. Provides independent progress bars per experiment and
-    direct access to results without file system polling.
-
-    Example:
-        manager = ExperimentManager(
-            base_config=load_config("configs/base.yaml"),
-            output_dir="outputs/comparison",
-            gpus=[0, 1],
-        )
-        manager.add("node_rank2", k_neighbors=64, radial_weight_rank=2)
-        manager.add("node_rank8", k_neighbors=64, radial_weight_rank=8)
-
-        results = manager.run(parallel=True)
-        manager.print_comparison()
+    This function is called in a subprocess for CUDA isolation.
     """
+    try:
+        # Set CUDA device for this process
+        if gpu >= 0 and torch.cuda.is_available():
+            torch.cuda.set_device(gpu)
+        device = torch.device(f"cuda:{gpu}" if gpu >= 0 else "cpu")
 
-    def __init__(
-        self,
-        base_config: ExperimentConfig,
-        output_dir: str | Path,
-        gpus: list[int] | None = None,
-    ) -> None:
-        """Initialize experiment manager.
+        # Import training functions
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "examples"))
+        from run_experiment import build_model, train_epoch, evaluate, get_kl_weight
 
-        Args:
-            base_config: Base configuration to use for all experiments.
-            output_dir: Directory to save experiment outputs.
-            gpus: List of GPU indices to use. None = auto-detect available GPUs.
-        """
-        self.base_config = base_config
-        self.output_dir = Path(output_dir)
-        self.gpus = gpus if gpus is not None else self._detect_gpus()
+        set_seed(config.seed)
 
-        self._experiments: dict[str, ExperimentConfig] = {}
-        self._results: dict[str, ExperimentResult] = {}
-        self._lock = Lock()
-        self._gpu_queue: queue.Queue[int] = queue.Queue()
-        self._dataset: StructureDataset | None = None
+        # Save config
+        exp_dir.mkdir(parents=True, exist_ok=True)
+        save_config(config, exp_dir / "config.yaml")
 
-    def _detect_gpus(self) -> list[int]:
-        """Detect available GPUs."""
-        if torch.cuda.is_available():
-            return list(range(torch.cuda.device_count()))
-        return [-1]  # CPU mode
-
-    def add(self, name: str, **overrides: Any) -> None:
-        """Add an experiment with config overrides.
-
-        Args:
-            name: Unique name for this experiment.
-            **overrides: Config overrides. Keys can be flat (e.g., k_neighbors=64)
-                or nested via dicts (e.g., model={"k_neighbors": 64}).
-        """
-        if name in self._experiments:
-            raise ValueError(f"Experiment '{name}' already exists")
-
-        config = self._apply_overrides(self.base_config, name, overrides)
-        self._experiments[name] = config
-        self._results[name] = ExperimentResult(name=name, config=config)
-
-    def _apply_overrides(
-        self,
-        base: ExperimentConfig,
-        name: str,
-        overrides: dict[str, Any],
-    ) -> ExperimentConfig:
-        """Apply config overrides to create new config."""
-        # Deep copy to avoid mutating base
-        config = copy.deepcopy(base)
-        config.name = name
-
-        # Apply overrides to appropriate nested config
-        for key, value in overrides.items():
-            if hasattr(config.model, key):
-                setattr(config.model, key, value)
-            elif hasattr(config.training, key):
-                setattr(config.training, key, value)
-            elif hasattr(config.data, key):
-                setattr(config.data, key, value)
-            elif hasattr(config, key):
-                setattr(config, key, value)
-            else:
-                raise ValueError(f"Unknown config key: {key}")
-
-        return config
-
-    def run(self, parallel: bool = True) -> dict[str, ExperimentResult]:
-        """Run all experiments.
-
-        Args:
-            parallel: If True, run experiments in parallel across GPUs.
-
-        Returns:
-            Dictionary mapping experiment names to results.
-        """
-        if not self._experiments:
-            raise ValueError("No experiments added. Use add() first.")
-
-        # Create output directory
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.output_dir = self.output_dir / timestamp
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Load shared dataset once
-        print("Loading dataset...")
-        self._dataset = self._load_dataset()
-
-        # Initialize GPU queue
-        for gpu in self.gpus:
-            self._gpu_queue.put(gpu)
-
-        # Create progress bars (one per experiment)
-        # Reserve space for all progress bars
-        print()  # Blank line before progress bars
-        pbars: dict[str, tqdm] = {}
-        for i, (name, cfg) in enumerate(self._experiments.items()):
-            pbars[name] = tqdm(
-                total=cfg.training.epochs,
-                desc=f"{name:<20}",
-                position=i,
-                leave=True,
-                ncols=100,
-            )
-
-        try:
-            if parallel and len(self.gpus) > 1 and len(self._experiments) > 1:
-                # Thread pool with one worker per GPU
-                with ThreadPoolExecutor(max_workers=len(self.gpus)) as executor:
-                    futures = {
-                        executor.submit(self._run_one, name, pbars[name]): name
-                        for name in self._experiments
-                    }
-                    for future in as_completed(futures):
-                        name = futures[future]
-                        try:
-                            future.result()
-                        except Exception as e:
-                            self._mark_failed(name, str(e))
-            else:
-                # Sequential execution
-                for name in self._experiments:
-                    try:
-                        self._run_one(name, pbars[name])
-                    except Exception as e:
-                        self._mark_failed(name, str(e))
-        finally:
-            # Close progress bars
-            for pbar in pbars.values():
-                pbar.close()
-
-        # Print summary
-        print("\n" * len(self._experiments))  # Clear space after progress bars
-        return self._results
-
-    def _mark_failed(self, name: str, error: str) -> None:
-        """Mark an experiment as failed."""
-        with self._lock:
-            self._results[name].status = "failed"
-            self._results[name].error = error
-
-    def _run_one(self, name: str, pbar: tqdm) -> None:
-        """Run single experiment with GPU from pool."""
-        import traceback
-
-        gpu = self._gpu_queue.get()
-        try:
-            # Set CUDA device for this thread
-            if gpu >= 0 and torch.cuda.is_available():
-                torch.cuda.set_device(gpu)
-            device = torch.device(f"cuda:{gpu}" if gpu >= 0 else "cpu")
-            result = self._train(name, device, pbar)
-            with self._lock:
-                self._results[name] = result
-        except Exception as e:
-            # Log full traceback for debugging
-            tb = traceback.format_exc()
-            with self._lock:
-                self._results[name].status = "failed"
-                self._results[name].error = str(e)
-            # Print traceback to help debug
-            print(f"\n[{name}] Error: {e}\n{tb}")
-        finally:
-            self._gpu_queue.put(gpu)
-
-    def _load_dataset(self) -> StructureDataset:
-        """Load dataset from config."""
-        config = self.base_config
+        # Load dataset
         level = "residue" if config.data.residue_level else "atom"
-        return StructureDataset.from_directory(
+        dataset = StructureDataset.from_directory(
             config.data.data_dir,
             scale="chain",
             level=level,
             max_atoms=config.data.max_atoms,
         )
 
-    def _train(
-        self,
-        name: str,
-        device: torch.device,
-        pbar: tqdm,
-    ) -> ExperimentResult:
-        """Training loop for a single experiment."""
-        # Import here to avoid circular imports
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "examples"))
-        from run_experiment import build_model, train_epoch, evaluate, get_kl_weight
-
-        config = self._experiments[name]
-        set_seed(config.seed)
-
-        # Create experiment output directory
-        exp_dir = self.output_dir / name
-        exp_dir.mkdir(parents=True, exist_ok=True)
-        save_config(config, exp_dir / "config.yaml")
-
-        # Split dataset and move to device
-        train_data, val_data, test_data = self._dataset.split(
+        # Split and move to device
+        train_data, val_data, test_data = dataset.split(
             train=config.data.train_split,
             val=config.data.val_split,
             seed=config.data.seed,
@@ -282,7 +100,7 @@ class ExperimentManager:
         test_data = test_data.to(device)
 
         # Build model
-        embedding, vae = build_model(config, self._dataset.num_feature_types, device)
+        embedding, vae = build_model(config, dataset.num_feature_types, device)
 
         # Setup optimizer and scheduler
         params = list(embedding.parameters()) + list(vae.parameters())
@@ -306,17 +124,10 @@ class ExperimentManager:
         best_epoch = 0
         patience = 0
 
-        result = ExperimentResult(
-            name=name,
-            config=config,
-            status="running",
-            output_dir=exp_dir,
-        )
-
         for epoch in range(1, config.training.epochs + 1):
             kl_weight = get_kl_weight(epoch, config)
 
-            # Train (disable inner progress bar)
+            # Train
             train_metrics = train_epoch(
                 embedding, vae, train_data, optimizer,
                 kl_weight, config.training.distance_weight,
@@ -351,12 +162,13 @@ class ExperimentManager:
             else:
                 patience += 1
 
-            # Update progress bar
-            pbar.update(1)
+            # Send progress update
             best_rmsd = history["val"][best_epoch - 1]["rmsd"] if best_epoch > 0 else float("inf")
-            pbar.set_postfix({
-                "rmsd": f"{val_metrics['rmsd']:.2f}Å",
-                "best": f"{best_rmsd:.2f}Å" if best_rmsd < float("inf") else "—",
+            progress_queue.put({
+                "name": name,
+                "epoch": epoch,
+                "val_rmsd": val_metrics["rmsd"],
+                "best_rmsd": best_rmsd,
             })
 
             # Early stopping
@@ -374,7 +186,7 @@ class ExperimentManager:
                 best_val_rmsd=float("inf"),
                 test_metrics=None,
                 status="failed",
-                error="No valid training samples (all filtered out)",
+                error="No valid training samples",
                 output_dir=exp_dir,
             )
 
@@ -412,6 +224,245 @@ class ExperimentManager:
             output_dir=exp_dir,
         )
 
+    except Exception as e:
+        tb = traceback.format_exc()
+        return ExperimentResult(
+            name=name,
+            config=config,
+            status="failed",
+            error=f"{e}\n{tb}",
+            output_dir=exp_dir,
+        )
+
+
+def _worker(
+    name: str,
+    config: ExperimentConfig,
+    exp_dir: Path,
+    gpu: int,
+    progress_queue: mp.Queue,
+    result_queue: mp.Queue,
+):
+    """Worker function that runs in a subprocess."""
+    result = _run_experiment_process(name, config, exp_dir, gpu, progress_queue)
+    result_queue.put(result)
+
+
+class ExperimentManager:
+    """Manage multiple experiments with progress tracking.
+
+    Uses multiprocessing for CUDA-safe parallel execution on multiple GPUs.
+    Each experiment runs in its own process with isolated CUDA context.
+
+    Example:
+        manager = ExperimentManager(
+            base_config=load_config("configs/base.yaml"),
+            output_dir="outputs/comparison",
+            gpus=[0, 1],
+        )
+        manager.add("exp1", k_neighbors=64, radial_weight_rank=2)
+        manager.add("exp2", k_neighbors=64, radial_weight_rank=8)
+
+        results = manager.run(parallel=True)
+        manager.print_comparison()
+    """
+
+    def __init__(
+        self,
+        base_config: ExperimentConfig,
+        output_dir: str | Path,
+        gpus: list[int] | None = None,
+    ) -> None:
+        """Initialize experiment manager.
+
+        Args:
+            base_config: Base configuration to use for all experiments.
+            output_dir: Directory to save experiment outputs.
+            gpus: List of GPU indices to use. None = auto-detect.
+        """
+        self.base_config = base_config
+        self.output_dir = Path(output_dir)
+        self.gpus = gpus if gpus is not None else self._detect_gpus()
+
+        self._experiments: dict[str, ExperimentConfig] = {}
+        self._results: dict[str, ExperimentResult] = {}
+
+    def _detect_gpus(self) -> list[int]:
+        """Detect available GPUs."""
+        if torch.cuda.is_available():
+            return list(range(torch.cuda.device_count()))
+        return [-1]  # CPU mode
+
+    def add(self, name: str, **overrides: Any) -> None:
+        """Add an experiment with config overrides.
+
+        Args:
+            name: Unique name for this experiment.
+            **overrides: Config overrides (e.g., k_neighbors=64).
+        """
+        if name in self._experiments:
+            raise ValueError(f"Experiment '{name}' already exists")
+
+        config = self._apply_overrides(self.base_config, name, overrides)
+        self._experiments[name] = config
+        self._results[name] = ExperimentResult(name=name, config=config)
+
+    def _apply_overrides(
+        self,
+        base: ExperimentConfig,
+        name: str,
+        overrides: dict[str, Any],
+    ) -> ExperimentConfig:
+        """Apply config overrides to create new config."""
+        config = copy.deepcopy(base)
+        config.name = name
+
+        for key, value in overrides.items():
+            if hasattr(config.model, key):
+                setattr(config.model, key, value)
+            elif hasattr(config.training, key):
+                setattr(config.training, key, value)
+            elif hasattr(config.data, key):
+                setattr(config.data, key, value)
+            elif hasattr(config, key):
+                setattr(config, key, value)
+            else:
+                raise ValueError(f"Unknown config key: {key}")
+
+        return config
+
+    def run(self, parallel: bool = True) -> dict[str, ExperimentResult]:
+        """Run all experiments.
+
+        Args:
+            parallel: If True, run experiments in parallel across GPUs.
+                Each experiment runs in a separate process for CUDA safety.
+
+        Returns:
+            Dictionary mapping experiment names to results.
+        """
+        if not self._experiments:
+            raise ValueError("No experiments added. Use add() first.")
+
+        # Create output directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.output_dir = self.output_dir / timestamp
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Setup multiprocessing
+        ctx = mp.get_context("spawn")  # spawn is safest for CUDA
+        progress_queue = ctx.Queue()
+        result_queue = ctx.Queue()
+
+        # Create progress bars
+        print()
+        pbars: dict[str, tqdm] = {}
+        for i, (name, cfg) in enumerate(self._experiments.items()):
+            pbars[name] = tqdm(
+                total=cfg.training.epochs,
+                desc=f"{name:<20}",
+                position=i,
+                leave=True,
+                ncols=100,
+            )
+
+        # Assign GPUs to experiments
+        exp_list = list(self._experiments.items())
+        gpu_assignments = [self.gpus[i % len(self.gpus)] for i in range(len(exp_list))]
+
+        try:
+            if parallel and len(self.gpus) > 1:
+                # Start all processes
+                processes = []
+                for (name, config), gpu in zip(exp_list, gpu_assignments):
+                    exp_dir = self.output_dir / name
+                    p = ctx.Process(
+                        target=_worker,
+                        args=(name, config, exp_dir, gpu, progress_queue, result_queue),
+                    )
+                    p.start()
+                    processes.append(p)
+
+                # Monitor progress until all complete
+                completed = 0
+                while completed < len(processes):
+                    # Check for progress updates (non-blocking)
+                    try:
+                        while True:
+                            update = progress_queue.get_nowait()
+                            name = update["name"]
+                            pbars[name].n = update["epoch"]
+                            pbars[name].set_postfix({
+                                "rmsd": f"{update['val_rmsd']:.2f}Å",
+                                "best": f"{update['best_rmsd']:.2f}Å",
+                            })
+                            pbars[name].refresh()
+                    except:
+                        pass
+
+                    # Check for completed results
+                    try:
+                        while True:
+                            result = result_queue.get_nowait()
+                            self._results[result.name] = result
+                            pbars[result.name].n = pbars[result.name].total
+                            pbars[result.name].refresh()
+                            completed += 1
+                    except:
+                        pass
+
+                    # Small sleep to avoid busy-waiting
+                    import time
+                    time.sleep(0.1)
+
+                # Wait for all processes
+                for p in processes:
+                    p.join()
+
+            else:
+                # Sequential execution
+                for (name, config), gpu in zip(exp_list, gpu_assignments):
+                    exp_dir = self.output_dir / name
+                    p = ctx.Process(
+                        target=_worker,
+                        args=(name, config, exp_dir, gpu, progress_queue, result_queue),
+                    )
+                    p.start()
+
+                    # Monitor this single process
+                    while p.is_alive():
+                        try:
+                            while True:
+                                update = progress_queue.get_nowait()
+                                pbars[name].n = update["epoch"]
+                                pbars[name].set_postfix({
+                                    "rmsd": f"{update['val_rmsd']:.2f}Å",
+                                    "best": f"{update['best_rmsd']:.2f}Å",
+                                })
+                                pbars[name].refresh()
+                        except:
+                            pass
+                        import time
+                        time.sleep(0.1)
+
+                    p.join()
+
+                    # Get result
+                    try:
+                        result = result_queue.get_nowait()
+                        self._results[result.name] = result
+                        pbars[name].n = pbars[name].total
+                        pbars[name].refresh()
+                    except:
+                        pass
+
+        finally:
+            for pbar in pbars.values():
+                pbar.close()
+
+        print("\n" * len(self._experiments))
+        return self._results
+
     @property
     def results(self) -> dict[str, ExperimentResult]:
         """Get all experiment results."""
@@ -434,7 +485,8 @@ class ExperimentManager:
 
         for result in sorted_results:
             if result.status == "failed":
-                print(f"{result.name:<20} {'—':<6} {'—':<6} {'FAILED':<12} {result.error or ''}")
+                error_short = (result.error or "Unknown error").split("\n")[0][:50]
+                print(f"{result.name:<20} {'—':<6} {'—':<6} {'FAILED':<12} {error_short}")
                 continue
 
             attn = result.config.model.attention_type[:4] if result.config else "—"
