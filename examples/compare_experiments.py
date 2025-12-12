@@ -426,6 +426,44 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Validate setup without training (load data, build model, run one forward pass)",
     )
+    # Training stability options
+    parser.add_argument(
+        "--kl_annealing",
+        type=str,
+        choices=["linear", "cyclical", "none"],
+        default=None,
+        help="KL annealing strategy (default: from config)",
+    )
+    parser.add_argument(
+        "--kl_warmup_epochs",
+        type=int,
+        default=None,
+        help="Epochs to anneal KL weight",
+    )
+    parser.add_argument(
+        "--kl_cycle_epochs",
+        type=int,
+        default=None,
+        help="Epochs per cycle for cyclical annealing",
+    )
+    parser.add_argument(
+        "--free_bits",
+        type=float,
+        default=None,
+        help="Minimum KL per dimension to prevent collapse",
+    )
+    parser.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=None,
+        help="LR warmup epochs",
+    )
+    parser.add_argument(
+        "--kl_weight",
+        type=float,
+        default=None,
+        help="KL weight",
+    )
 
     return parser.parse_args()
 
@@ -462,6 +500,19 @@ def main():
     extra_args.extend(["--num_recon_samples", str(args.num_recon_samples)])
     if getattr(args, 'dry_run', False):
         extra_args.append("--dry-run")
+    # Training stability options
+    if args.kl_annealing:
+        extra_args.extend(["--kl_annealing", args.kl_annealing])
+    if args.kl_warmup_epochs is not None:
+        extra_args.extend(["--kl_warmup_epochs", str(args.kl_warmup_epochs)])
+    if args.kl_cycle_epochs is not None:
+        extra_args.extend(["--kl_cycle_epochs", str(args.kl_cycle_epochs)])
+    if args.free_bits is not None:
+        extra_args.extend(["--free_bits", str(args.free_bits)])
+    if args.warmup_epochs is not None:
+        extra_args.extend(["--warmup_epochs", str(args.warmup_epochs)])
+    if args.kl_weight is not None:
+        extra_args.extend(["--kl_weight", str(args.kl_weight)])
 
     # Verify base config exists
     if not Path(args.config).exists():
