@@ -67,11 +67,17 @@ def compute_loss(
 
         # SVD for optimal rotation
         H = pred_centered.T @ target_centered
-        U, _, Vt = torch.linalg.svd(H)
-        R = Vt.T @ U.T
-        if torch.linalg.det(R) < 0:
-            Vt[-1, :] *= -1
-            R = Vt.T @ U.T
+        U, S, Vt = torch.linalg.svd(H)
+
+        # Handle reflection case without in-place ops
+        det = torch.linalg.det(Vt.T @ U.T)
+        sign = torch.ones(3, device=coords_pred.device, dtype=coords_pred.dtype)
+        sign = torch.where(
+            det < 0,
+            torch.tensor([1.0, 1.0, -1.0], device=coords_pred.device, dtype=coords_pred.dtype),
+            sign,
+        )
+        R = (Vt.T * sign) @ U.T
 
         aligned = pred_centered @ R.T
         rmsd = ((aligned - target_centered) ** 2).sum(dim=-1).mean().sqrt()
